@@ -597,6 +597,7 @@ class InformerForecaster(nn.Module):
         self.dropout = config["dropout"]
         self.distill = config["distill"]
         self.factor = config["factor"]
+        self.use_time_embedding = config.get("use_time_embedding")  # default to True for backward compatibility
 
         # Input embeddings
         self.enc_embedding = nn.Linear(self.d_input, self.d_model)
@@ -606,9 +607,10 @@ class InformerForecaster(nn.Module):
         self.pos_enc = PositionalEncoding(self.d_model)
         
         # Time embeddings for different granularities
-        self.month_embedding = TimeEmbedding(self.d_model, max_period=12, embedding_type="month")
-        self.hour_embedding = TimeEmbedding(self.d_model, max_period=24, embedding_type="hour")
-        self.day_embedding = TimeEmbedding(self.d_model, max_period=31, embedding_type="day")
+        if self.use_time_embedding:
+            self.month_embedding = TimeEmbedding(self.d_model, max_period=12, embedding_type="month")
+            self.hour_embedding = TimeEmbedding(self.d_model, max_period=24, embedding_type="hour")
+            self.day_embedding = TimeEmbedding(self.d_model, max_period=31, embedding_type="day")
 
         self.encoder = Encoder(self.d_model, self.n_heads, self.d_ff, self.enc_layers,
                                dropout=self.dropout, distill=self.distill, factor=self.factor)
@@ -647,8 +649,8 @@ class InformerForecaster(nn.Module):
         dec_input = torch.cat([dec_context, dec_future], dim=1)
         dec_h = self.pos_enc(self.dec_embedding(dec_input))
         
-        # Add time embeddings to decoder if provided
-        if timestamps is not None:
+        # Add time embeddings to decoder if enabled and provided
+        if self.use_time_embedding and timestamps is not None:
             dec_timestamps = timestamps[:, self.enc_len - self.guiding_len: self.enc_len + self.pred_len]
             month_emb = self.month_embedding(dec_timestamps)
             hour_emb = self.hour_embedding(dec_timestamps)
