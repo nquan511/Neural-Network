@@ -1,0 +1,17 @@
+Total Learnable Parameters: 185,793
+
+Model Configuration:
+d_input: 10
+d_model: 64
+n_heads: 4
+d_ff: 64
+enc_layers: 3
+dec_layers: 2
+dropout: 0.0
+enc_len: 96
+guiding_len: 48
+pred_len: 24
+factor: 5
+distill: True
+use_time_embedding: False
+total_learnable_parameters: 185793
