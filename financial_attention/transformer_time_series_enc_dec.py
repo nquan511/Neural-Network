@@ -182,7 +182,6 @@ class ProbSparseSelfAttention(Attention):
        - Uses no_grad for mean calculations to save memory
        
     3. Numerical Stability:
-       - Adds epsilon to prevent underflow
        - Uses logsumexp for stable probability computation
        - Properly handles attention masking
     
@@ -216,15 +215,13 @@ class ProbSparseSelfAttention(Attention):
         # Sample a subset of keys for efficient scoring
         # k: number of keys to sample (min of sample_k or available keys)
         k = min(sample_k, L_K)
-        # Randomly select k indices from the key sequence
-        index_sample = torch.randint(L_K, (k,), device=K.device)
-        # Extract the sampled keys
-        K_sample = K[:, :, index_sample, :]
+        # Randomly select k indices from the key sequence - randperm ensures no duplicates
+        perm = torch.randperm(L_K, device=K.device)[:k]
+        K_sample = K[:, :, perm, :]
 
         # Compute attention scores for sampled keys
         # Shape: [B, H, L_Q, k]
         Q_K_sample = torch.matmul(Q, K_sample.transpose(-2, -1)) / math.sqrt(D)
-        eps = 1e-8  # Prevent log(0) and numerical underflow
 
         # Compute mean attention score (no gradients needed)
         # This represents the average interaction strength
@@ -235,7 +232,7 @@ class ProbSparseSelfAttention(Attention):
         # 1. Add epsilon for numerical stability
         # 2. Use logsumexp for stable probability computation
         # 3. Subtract mean to get relative importance
-        M = torch.logsumexp(Q_K_sample + eps, dim=-1) - mean_K.squeeze(-1)
+        M = torch.logsumexp(Q_K_sample, dim=-1) - mean_K.squeeze(-1)
 
         # Select top-n query positions based on sparsity scores
         # Returns indices of top n_top queries for each batch and head
@@ -304,19 +301,19 @@ class EncoderLayer(nn.Module):
     """
     Single layer of the encoder stack with self-attention and optional distillation.
     
-    This layer implements the pre-norm transformer architecture with an additional
+    This layer implements the post-norm transformer architecture with an additional
     distillation mechanism for processing long sequences efficiently.
     
     Architecture:
     ------------
     1. Self-Attention Block:
        - ProbSparse self-attention for efficient processing
-       - Pre-normalization for training stability
        - Residual connection and dropout
+       - Post-normalization for training stability
        
     2. Feed-Forward Block:
        - Two linear transformations with GELU activation
-       - Pre-normalization and residual connection
+       - Post-normalization and residual connection
        - Dropout for regularization
        
     3. Optional Distillation (if enabled):
@@ -368,24 +365,24 @@ class DecoderLayer(nn.Module):
     """
     Single layer of the decoder stack with self-attention and cross-attention mechanisms.
     
-    This layer implements a pre-norm transformer decoder architecture with both
+    This layer implements a post-norm transformer decoder architecture with both
     masked self-attention and cross-attention to the encoder outputs.
     
     Architecture:
     ------------
     1. Masked Self-Attention:
        - ProbSparse self-attention with causal masking
-       - Pre-normalization for stability
+       - Post-normalization for stability
        - Residual connection and dropout
        
     2. Cross-Attention:
        - Standard attention to encoder outputs
        - Enables information flow from encoder
-       - Pre-normalization and residual connection
+       - Post-normalization and residual connection
        
     3. Feed-Forward:
        - Two linear transformations with GELU
-       - Final pre-normalization
+       - Final post-normalization
        - Residual connection and dropout
     
     Args:
@@ -557,36 +554,58 @@ class PositionalEncoding(nn.Module):
         return cls(d_model, max_len)
 
 
-# Informer Forecaster (unchanged)
 class TimeEmbedding(nn.Module):
     """
-    Embeddings for different time granularities (minute, hour, day)
+    Learnable time embeddings for (hour, weekday, month).
+    Each embedding has a small latent dimension, and the combined vector
+    is projected to d_model via an MLP projection layer.
     """
-    def __init__(self, d_model, max_period, embedding_type="hour"):
+    def __init__(self, d_model: int, embed_dim: int = 8, dropout: float = 0.1):
         super().__init__()
-        self.embedding = nn.Embedding(max_period, d_model)
-        self.embedding_type = embedding_type
 
-    def forward(self, timestamps):
+        # Small embeddings for each temporal granularity
+        self.hour_embedding = nn.Embedding(24, embed_dim)
+        self.weekday_embedding = nn.Embedding(7, embed_dim)
+        self.month_embedding = nn.Embedding(12, embed_dim)
+
+        # Projection to model dimension (jointly learns temporal interactions)
+        self.time_mlp = nn.Sequential(
+            nn.Linear(embed_dim * 3, d_model),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(d_model, d_model),
+        )
+
+        # Initialization (optional but improves early stability)
+        for m in self.time_mlp:
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def forward(self, timestamps: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            timestamps: Tensor of shape [batch_size, seq_len, 3] where the last dimension contains
-                       [minute, hour, day] components in that order
+            timestamps: Tensor [B, L, 3] with (hour, weekday, month)
+        Returns:
+            time_emb: Tensor [B, L, d_model]
         """
-        if self.embedding_type == "hour":
-            time_component = timestamps[:, :, 0]  
-        elif self.embedding_type == "day":
-            time_component = timestamps[:, :, 1] 
-        elif self.embedding_type == "month":
-            time_component = timestamps[:, :, 2]  
-        else:
-            raise ValueError(f"Unknown embedding type: {self.embedding_type}")
-        
-        return self.embedding(time_component)
+        if timestamps.size(-1) != 3:
+            raise ValueError("timestamps must have shape [B, L, 3] with (hour, weekday, month)")
+
+        hour_emb = self.hour_embedding(timestamps[:, :, 0])
+        weekday_emb = self.weekday_embedding(timestamps[:, :, 1])
+        month_emb = self.month_embedding(timestamps[:, :, 2])
+
+        # Concatenate along the feature dimension and project
+        time_features = torch.cat([hour_emb, weekday_emb, month_emb], dim=-1)
+        time_emb = self.time_mlp(time_features)
+        return time_emb
 
 class InformerForecaster(nn.Module):
     def __init__(self, config, asset_index=0):
         super().__init__()
+        
         self.asset_index = asset_index
         self.d_input = config["d_input"]
         self.d_model = config["d_model"]
@@ -597,27 +616,33 @@ class InformerForecaster(nn.Module):
         self.dropout = config["dropout"]
         self.distill = config["distill"]
         self.factor = config["factor"]
-        self.use_time_embedding = config.get("use_time_embedding")  # default to True for backward compatibility
+        self.use_time_embedding = config.get("use_time_embedding", False)
 
         # Input embeddings
         self.enc_embedding = nn.Linear(self.d_input, self.d_model)
         self.dec_embedding = nn.Linear(self.d_input, self.d_model)
-        
+
         # Positional encoding
         self.pos_enc = PositionalEncoding(self.d_model)
-        
-        # Time embeddings for different granularities
-        if self.use_time_embedding:
-            self.month_embedding = TimeEmbedding(self.d_model, max_period=12, embedding_type="month")
-            self.hour_embedding = TimeEmbedding(self.d_model, max_period=24, embedding_type="hour")
-            self.day_embedding = TimeEmbedding(self.d_model, max_period=31, embedding_type="day")
 
-        self.encoder = Encoder(self.d_model, self.n_heads, self.d_ff, self.enc_layers,
-                               dropout=self.dropout, distill=self.distill, factor=self.factor)
-        self.decoder = Decoder(self.d_model, self.n_heads, self.d_ff, self.dec_layers,
-                               dropout=self.dropout, factor=self.factor)
+        # Optional time embedding
+        if self.use_time_embedding:
+            self.time_embedding = TimeEmbedding(self.d_model, embed_dim=8, dropout=self.dropout)
+
+        # Transformer backbone
+        self.encoder = Encoder(
+            self.d_model, self.n_heads, self.d_ff, self.enc_layers,
+            dropout=self.dropout, distill=self.distill, factor=self.factor
+        )
+        self.decoder = Decoder(
+            self.d_model, self.n_heads, self.d_ff, self.dec_layers,
+            dropout=self.dropout, factor=self.factor
+        )
+
+        # Output projection
         self.proj = nn.Linear(self.d_model, 1)
 
+        # Sequence structure
         self.enc_len = config["enc_len"]
         self.guiding_len = config["guiding_len"]
         self.pred_len = config["pred_len"]
@@ -625,43 +650,49 @@ class InformerForecaster(nn.Module):
     def forward(self, seq, timestamps=None):
         """
         seq: [B, L_total, d_input]
-        Must have L_total >= enc_len + pred_len
-        timestamps: [B, L_total] optional, datetime tensor for time embeddings
+        timestamps: [B, L_total, 3] (hour, weekday, month)
         """
-        if seq.size(1) < self.enc_len + self.pred_len:
-            raise ValueError(f"Input sequence length {seq.size(1)} is too short. "
-                           f"Required length: {self.enc_len + self.pred_len}")
-        
-        device = seq.device
-        B = seq.size(0)
+        L_total = seq.size(1)
+        if L_total < self.enc_len + self.pred_len:
+            raise ValueError(
+                f"Input sequence too short ({L_total}) — need at least enc_len + pred_len = "
+                f"{self.enc_len + self.pred_len}"
+            )
 
-        # Encoder processing
+        if self.use_time_embedding:
+            if timestamps is None:
+                raise ValueError("timestamps required when use_time_embedding=True")
+            if timestamps.size(-1) != 3:
+                raise ValueError("timestamps must have shape [B, L, 3] (hour, weekday, month)")
+
+        # ----- Encoder -----
         enc_x = seq[:, :self.enc_len, :]
-        enc_h = self.pos_enc(self.enc_embedding(enc_x))
+        enc_h = self.enc_embedding(enc_x)
+        if self.use_time_embedding and timestamps is not None:
+            enc_ts = timestamps[:, :self.enc_len]
+            enc_h += self.time_embedding(enc_ts)
+        enc_h = self.pos_enc(enc_h)
         enc_out = self.encoder(enc_h)
 
-        # Decoder input = guiding context + zeros
+        # ----- Decoder -----
         dec_context = seq[:, self.enc_len - self.guiding_len: self.enc_len, :]
         dec_future = seq[:, self.enc_len: self.enc_len + self.pred_len, :].clone()
-        # Use proper device for zero tensor
-        dec_future[:, :, self.asset_index] = torch.zeros(dec_future.size(0), dec_future.size(1), 
-                                                        device=device)
+        dec_future[:, :, self.asset_index] = 0.0
+
         dec_input = torch.cat([dec_context, dec_future], dim=1)
         dec_h = self.pos_enc(self.dec_embedding(dec_input))
-        
-        # Add time embeddings to decoder if enabled and provided
-        if self.use_time_embedding and timestamps is not None:
-            dec_timestamps = timestamps[:, self.enc_len - self.guiding_len: self.enc_len + self.pred_len]
-            month_emb = self.month_embedding(dec_timestamps)
-            hour_emb = self.hour_embedding(dec_timestamps)
-            day_emb = self.day_embedding(dec_timestamps)
-            dec_h = dec_h + month_emb + hour_emb + day_emb
-            
-        dec_out = self.decoder(dec_h, enc_out)
 
-        # Only predict on placeholder region
+        # Add time embeddings if enabled
+        if self.use_time_embedding:
+            dec_timestamps = timestamps[:, self.enc_len - self.guiding_len: self.enc_len + self.pred_len]
+            time_emb = self.time_embedding(dec_timestamps)
+            dec_h = dec_h + time_emb
+
+        # Decode and project
+        dec_out = self.decoder(dec_h, enc_out)
         out = self.proj(dec_out[:, -self.pred_len:, :])
         return out.squeeze(-1)
+
 
 # =====================================================
 # Dataset and Data Loading Utilities
@@ -684,7 +715,7 @@ class TimeSeriesDataset(Dataset):
        
     2. Time Features:
        - Preserves datetime information
-       - Supports minute, hour, day embeddings
+       - Supports weekday, hour, month embeddings
        - Maintains temporal ordering
        
     Args:
@@ -718,7 +749,7 @@ class TimeSeriesDataset(Dataset):
         return self.samples
 
     def _convert_timestamps_to_tensor(self, timestamps):
-        """Convert timestamps to tensors with minute, hour, and day components"""
+        """Convert timestamps to tensors with hour, weekday and month components"""
         hours = torch.tensor(timestamps.hour.values, dtype=torch.long)
         weekdays = torch.tensor(timestamps.weekday.values, dtype=torch.long)
         months = torch.tensor(timestamps.month.values - 1, dtype=torch.long)
@@ -742,7 +773,7 @@ class TimeSeriesDataset(Dataset):
         
         return torch.tensor(seq, dtype=torch.float32), time_tensor
 
-def create_dataloaders(df, enc_len=96, pred_len=24, batch_size=32, val_batch_size=1, val_ratio=0.1, asset_name="SOL"):
+def create_dataloaders(df, enc_len=96, pred_len=24, batch_size=32, val_batch_size=1,val_shuffle = False,val_ratio=0.1, asset_name="SOL"):
     """
     Create training and validation dataloaders with proper data preprocessing and timestamp handling.
     
@@ -768,7 +799,7 @@ def create_dataloaders(df, enc_len=96, pred_len=24, batch_size=32, val_batch_siz
     3. Time Features:
        - Extracts timestamps from DataFrame index
        - Preserves temporal information
-       - Supports minute, hour, day embeddings
+       - Supports weekday, hour, month embeddings
        
     4. DataLoader Configuration:
        - Batch processing with timestamps
@@ -826,7 +857,7 @@ def create_dataloaders(df, enc_len=96, pred_len=24, batch_size=32, val_batch_siz
     # Create dataloaders with custom collate function
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, 
                             drop_last=True, collate_fn=collate_fn)
-    val_loader = DataLoader(val_ds, batch_size=val_batch_size, shuffle=False, 
+    val_loader = DataLoader(val_ds, batch_size=val_batch_size, shuffle=val_shuffle, 
                           drop_last=False, collate_fn=collate_fn)
 
     return train_loader, val_loader, scaler, asset_index
@@ -888,6 +919,7 @@ class TrainConfig:
     use_lr_schedule: bool = True
     # Early stopping
     patience: int = 5  # Number of validation checks without improvement before stopping
+    min_delta: float = 0.0001  # Minimum change to qualify as an improvement
     # device
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     
@@ -994,6 +1026,18 @@ def train_model(model: nn.Module,
                 val_loader: DataLoader,
                 cfg: TrainConfig,
                 asset_index: int = 0):
+    """Train model with early stopping based on validation loss.
+    
+    Args:
+        model: Model to train
+        train_loader: Training data loader
+        val_loader: Validation data loader
+        cfg: Training configuration
+        asset_index: Index of target asset
+        
+    Returns:
+        tuple: (trained model, training losses, validation losses, step numbers)
+    """
     device = torch.device(cfg.device)
     model = model.to(device)
 
@@ -1005,9 +1049,12 @@ def train_model(model: nn.Module,
     train_loss_history = []
     val_loss_history = []
     steps_history = []
+    best_val_loss = float('inf')
+    patience_counter = 0
+    best_model_state = None
+    early_stop = False
 
     loss_fn = nn.MSELoss()
-
     model.train()
     while step < cfg.max_steps:
         for batch_idx, (batch_data, batch_timestamps) in enumerate(train_loader):
@@ -1026,7 +1073,7 @@ def train_model(model: nn.Module,
             autocast_ctx = torch.autocast(device_type=device.type, dtype=torch.float16, 
                                         enabled=(cfg.use_amp and device.type == "cuda"))
             with autocast_ctx:
-                y_pred = model(batch_data,batch_timestamps)  # [B, pred_len]
+                y_pred = model(batch_data, batch_timestamps)  # [B, pred_len]
                 loss = loss_fn(y_pred, y_true)
 
             # backward + scaling
@@ -1052,7 +1099,7 @@ def train_model(model: nn.Module,
                 steps_history.append(step)
                 start_time = time.time()
 
-            # validation
+            # Validation
             if step % 100 == 0 and val_loader is not None:
                 model.eval()
                 val_losses = []
@@ -1065,12 +1112,32 @@ def train_model(model: nn.Module,
                         val_losses.append(loss_fn(vy_pred, vy_true).item())
                 mean_val_loss = float(np.mean(val_losses)) if len(val_losses) > 0 else float('nan')
                 val_loss_history.append((step, mean_val_loss))
-                log.info(f"step {step} | VALIDATION loss {mean_val_loss:.6f}")
+                
+                # Early stopping check
+                if mean_val_loss < best_val_loss - cfg.min_delta:
+                    best_val_loss = mean_val_loss
+                    patience_counter = 0
+                    # Save best model state
+                    best_model_state = {k: v.cpu() for k, v in model.state_dict().items()}
+                else:
+                    patience_counter += 1
+                    if patience_counter >= cfg.patience:
+                        log.info(f"Early stopping triggered after {step} steps. Best validation loss: {best_val_loss:.6f}")
+                        # Restore best model state
+                        if best_model_state is not None:
+                            model.load_state_dict(best_model_state)
+                        early_stop = True
+                        break
+                
+                log.info(f"step {step} | VALIDATION loss {mean_val_loss:.6f} | best {best_val_loss:.6f} | patience {patience_counter}/{cfg.patience}")
                 model.train()
 
             step += 1
-            if step >= cfg.max_steps:
+            if step >= cfg.max_steps or early_stop:
                 break
+        
+        if early_stop:
+            break
 
     return model, train_loss_history, val_loss_history, steps_history
 
