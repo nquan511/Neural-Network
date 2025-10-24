@@ -145,6 +145,7 @@ class GPT(nn.Module):
                 # standard deviation grows inside the residual connection stream
                 # hence, we scaledown the initialization of the final projection to compensate
                 std = std * (2*self.config.n_layer) ** -0.5
+                # further scale down std by the number of layers and residual connections
                 # we use 2 times since we apply 2 residual connections per block layer - see forward of Block class
             torch.nn.init.normal_(module.weight, mean=0.0, std=std)
             if module.bias is not None:

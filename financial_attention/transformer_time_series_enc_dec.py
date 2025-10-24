@@ -94,7 +94,7 @@ class Attention(nn.Module):
         - Output: (batch_size, seq_length, d_model)
         - Attention mask: (seq_length, seq_length) or (batch_size, n_heads, seq_length, seq_length)
     """
-    def __init__(self, d_model, n_heads, attention_dropout=0.1, mask_flag=True):
+    def __init__(self, d_model, n_heads, attention_dropout=0.1, mask_flag=False):
         super().__init__()
         if d_model % n_heads != 0:
             raise ValueError(f"d_model ({d_model}) must be divisible by n_heads ({n_heads})")
@@ -102,64 +102,40 @@ class Attention(nn.Module):
         self.d_model = d_model
         self.n_heads = n_heads
         self.d_k = d_model // n_heads
+        # Default with no causal since only use in Cross-Attention
         self.mask_flag = mask_flag
 
         self.q_proj = nn.Linear(d_model, d_model)
         self.k_proj = nn.Linear(d_model, d_model)
         self.v_proj = nn.Linear(d_model, d_model)
         self.o_proj = nn.Linear(d_model, d_model)
+        # Residual projection: scale init per GPT residual trick
+        self.o_proj.NANOGPT_SCALE_INIT = 1.0
         # Apply dropout to both attention weights and output
         self.attn_dropout = nn.Dropout(attention_dropout)
         self.out_dropout = nn.Dropout(attention_dropout)
 
-    def forward(self, Q, K, V, attn_mask=None):
+    def forward(self, Q, K, V, attn_mask=None, causal=False):
         # Extract input dimensions
-        # B: batch size, L_Q: query sequence length, D: model dimension
         B, L_Q, D = Q.shape
-        # L_K: key sequence length (same as value sequence length)
         _, L_K, _ = K.shape
 
-        # Multi-head projection and reshaping:
-        # 1. Linear projection to d_model dimensions
-        # 2. Reshape to separate heads: [B, L, D] -> [B, L, H, D/H]
-        # 3. Transpose for attention: [B, L, H, D/H] -> [B, H, L, D/H]
-        # Final shape: [batch_size, n_heads, seq_length, d_k]
+        # Project to multi-head and rearrange to [B, H, L, d_k]
         Q = self.q_proj(Q).view(B, L_Q, self.n_heads, self.d_k).transpose(1, 2)
         K = self.k_proj(K).view(B, L_K, self.n_heads, self.d_k).transpose(1, 2)
         V = self.v_proj(V).view(B, L_K, self.n_heads, self.d_k).transpose(1, 2)
 
-        # Compute attention scores
-        # 1. Matrix multiply Q and K^T: [B, H, L_Q, d_k] @ [B, H, d_k, L_K]
-        # 2. Scale by sqrt(d_k) for stable gradients
-        # Result shape: [batch_size, n_heads, L_Q, L_K]
-        # Compute attention scores with scaling
-        attn_scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.d_k)
+        # Fused scaled dot-product attention (FlashAttention when available)
+        dropout_p = self.attn_dropout.p if self.training else 0.0
+        out = F.scaled_dot_product_attention(
+            Q, K, V,
+            dropout_p=dropout_p,
+            is_causal=self.mask_flag
+        )  # [B, H, L_Q, d_k]
 
-        # Apply attention masking if provided
-        if attn_mask is not None:
-            # Handle different mask shapes:
-            # - 2D mask [L_Q, L_K]: Expand to 4D [1, 1, L_Q, L_K]
-            # - 4D mask [B, H, L_Q, L_K]: Use as is
-            if attn_mask.dim() == 2:
-                attn_mask = attn_mask.unsqueeze(0).unsqueeze(0)
-            # Replace masked positions with -inf before softmax
-            attn_scores = attn_scores.masked_fill(attn_mask == 0, float('-inf'))
-
-        # Compute attention weights:
-        # 1. Apply softmax to get probabilities
-        # 2. Apply dropout for regularization
-        # Shape: [batch_size, n_heads, L_Q, L_K]
-        attn = torch.softmax(attn_scores, dim=-1)
-        attn = self.attn_dropout(attn)
-
-        # Compute output:
-        # 1. Matrix multiply with values: [B, H, L_Q, L_K] @ [B, H, L_K, d_k]
-        # 2. Transpose and reshape back to original dimensions
-        # 3. Project to final output space
-        # 4. Apply output dropout
-        out = torch.matmul(attn, V)  # [B, H, L_Q, d_k]
-        out = out.transpose(1, 2).contiguous().view(B, L_Q, D)  # [B, L_Q, D]
-        out = self.o_proj(out)  # Final projection
+        # Merge heads and project
+        out = out.transpose(1, 2).contiguous().view(B, L_Q, D)
+        out = self.o_proj(out)
         return self.out_dropout(out)
 
 class ProbSparseSelfAttention(Attention):
@@ -353,10 +329,9 @@ class EncoderLayer(nn.Module):
             )
 
     def forward(self, x):
-        x = x + self.dropout(self.attn(x, x, x))
-        x = self.norm1(x)
-        x = x + self.dropout(self.ff(x))
-        x = self.norm2(x)
+        norm_x = self.norm1(x)
+        x = x + self.dropout(self.attn(norm_x, norm_x, norm_x))
+        x = x + self.dropout(self.ff(self.norm2(x)))
         if self.distill:
             x = self.conv(x.transpose(1, 2)).transpose(1, 2)
         return x
@@ -413,12 +388,10 @@ class DecoderLayer(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, dec, enc,attn_mask=None):
-        dec = dec + self.dropout(self.self_attn(dec, dec, dec, attn_mask=attn_mask))
-        dec = self.norm1(dec)
-        dec = dec + self.dropout(self.cross_attn(dec, enc, enc))
-        dec = self.norm2(dec)
-        dec = dec + self.dropout(self.ff(dec))
-        dec = self.norm3(dec)
+        norm_dec_1 = self.norm1(dec)
+        dec = dec + self.dropout(self.self_attn(norm_dec_1, norm_dec_1, norm_dec_1, attn_mask=attn_mask))
+        dec = dec + self.dropout(self.cross_attn(self.norm2(dec), enc, enc))
+        dec = dec + self.dropout(self.ff(self.norm3(dec)))
         return dec
 
 class Encoder(nn.Module):
@@ -465,11 +438,32 @@ class Encoder(nn.Module):
             EncoderLayer(d_model, n_heads, d_ff, dropout, distill=(distill and i < (n_layers - 1)), factor=factor)
             for i in range(n_layers)
         ])
+        self.final_norm = nn.LayerNorm(d_model)
+        self.n_layers = n_layers
+        #initialize weights
+        self.apply(self._init_weights)
 
     def forward(self, x):
         for layer in self.layers:
             x = layer(x)
-        return x
+        return self.final_norm(x)
+    
+    def _init_weights(self, module: nn.Module):
+        # standard deviation grows inside the residual connection stream
+        # hence, we scaledown the initialization of the final projection to compensate
+        # 0.02 is the default std used in GPT
+        std = 0.02
+        if isinstance(module, nn.Linear):
+            if hasattr(module, "NANOGPT_SCALE_INIT") and getattr(module, "NANOGPT_SCALE_INIT"):
+                # we use 2 times since we apply 2 residual connections per layer - 
+                # see forward of EncoderLayer class
+                std = std * (2 * self.n_layers) ** -0.5
+            nn.init.normal_(module.weight, mean=0.0, std=std)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.LayerNorm):
+            # layernorm defaults are fine
+            pass
 
 class Decoder(nn.Module):
     """
@@ -514,6 +508,11 @@ class Decoder(nn.Module):
             DecoderLayer(d_model, n_heads, d_ff, dropout, factor)
             for _ in range(n_layers)
         ])
+        self.final_norm = nn.LayerNorm(d_model)
+        self.n_layers = n_layers
+
+        #initialize weights
+        self.apply(self._init_weights)
 
     def forward(self, dec, enc):
         seq_len = dec.size(1)
@@ -521,7 +520,23 @@ class Decoder(nn.Module):
         attn_mask = generate_causal_mask(seq_len, device)
         for layer in self.layers:
             dec = layer(dec, enc, attn_mask=attn_mask)
-        return dec
+        return self.final_norm(dec)
+    
+    def _init_weights(self, module: nn.Module):
+        # standard deviation grows inside the residual connection stream
+        # hence, we scaledown the initialization of the final projection to compensate
+        std = 0.02
+        if isinstance(module, nn.Linear):
+            if hasattr(module, "NANOGPT_SCALE_INIT") and getattr(module, "NANOGPT_SCALE_INIT"):
+                # we use 3 times since we apply 3 residual connections per layer - 
+                # see forward of DecoderLayer class
+                std = std * (3 * self.n_layers) ** -0.5
+            nn.init.normal_(module.weight, mean=0.0, std=std)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.LayerNorm):
+            # layernorm defaults are fine
+            pass
 
 # Positional Encoding
 class PositionalEncoding(nn.Module):
@@ -576,13 +591,6 @@ class TimeEmbedding(nn.Module):
             nn.Linear(d_model, d_model),
         )
 
-        # Initialization (optional but improves early stability)
-        for m in self.time_mlp:
-            if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight)
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-
     def forward(self, timestamps: torch.Tensor) -> torch.Tensor:
         """
         Args:
@@ -628,6 +636,8 @@ class InformerForecaster(nn.Module):
         # Optional time embedding
         if self.use_time_embedding:
             self.time_embedding = TimeEmbedding(self.d_model, embed_dim=8, dropout=self.dropout)
+            # Normalize combined (content + time) representations to stabilize scale
+            self.time_add_norm = nn.LayerNorm(self.d_model)
 
         # Transformer backbone
         self.encoder = Encoder(
@@ -655,8 +665,7 @@ class InformerForecaster(nn.Module):
         L_total = seq.size(1)
         if L_total < self.enc_len + self.pred_len:
             raise ValueError(
-                f"Input sequence too short ({L_total}) — need at least enc_len + pred_len = "
-                f"{self.enc_len + self.pred_len}"
+                f"Input sequence too short ({L_total}); need at least enc_len + pred_len = {self.enc_len + self.pred_len}"
             )
 
         if self.use_time_embedding:
@@ -668,16 +677,17 @@ class InformerForecaster(nn.Module):
         # ----- Encoder -----
         enc_x = seq[:, :self.enc_len, :]
         enc_h = self.enc_embedding(enc_x)
+        enc_h = self.pos_enc(enc_h)
+        # Add time embeddings if enabled
         if self.use_time_embedding and timestamps is not None:
             enc_ts = timestamps[:, :self.enc_len]
-            enc_h += self.time_embedding(enc_ts)
-        enc_h = self.pos_enc(enc_h)
+            enc_h = self.time_add_norm(enc_h + self.time_embedding(enc_ts))
         enc_out = self.encoder(enc_h)
 
         # ----- Decoder -----
         dec_context = seq[:, self.enc_len - self.guiding_len: self.enc_len, :]
         dec_future = seq[:, self.enc_len: self.enc_len + self.pred_len, :].clone()
-        dec_future[:, :, self.asset_index] = 0.0
+        dec_future[:, :, self.asset_index] = 0.0 # Mask target variable
 
         dec_input = torch.cat([dec_context, dec_future], dim=1)
         dec_h = self.pos_enc(self.dec_embedding(dec_input))
@@ -685,8 +695,7 @@ class InformerForecaster(nn.Module):
         # Add time embeddings if enabled
         if self.use_time_embedding:
             dec_timestamps = timestamps[:, self.enc_len - self.guiding_len: self.enc_len + self.pred_len]
-            time_emb = self.time_embedding(dec_timestamps)
-            dec_h = dec_h + time_emb
+            dec_h = self.time_add_norm(dec_h + self.time_embedding(dec_timestamps))
 
         # Decode and project
         dec_out = self.decoder(dec_h, enc_out)
@@ -933,21 +942,6 @@ class TrainConfig:
         if self.patience < 1:
             raise ValueError("patience must be at least 1")
 
-def _init_weights(module: nn.Module, std: float = 0.02, n_layer: int = 12):
-    """
-    partial/gpt-style initialization for linear and embedding layers (optional)
-    """
-    if isinstance(module, nn.Linear):
-        local_std = std
-        if hasattr(module, "NANOGPT_SCALE_INIT") and getattr(module, "NANOGPT_SCALE_INIT"):
-            local_std = std * (2 * n_layer) ** -0.5
-        nn.init.normal_(module.weight, mean=0.0, std=local_std)
-        if module.bias is not None:
-            nn.init.zeros_(module.bias)
-    elif isinstance(module, nn.LayerNorm):
-        # layernorm defaults are fine
-        pass
-
 def configure_optimizers(model: nn.Module, weight_decay: float, learning_rate: float, device_type: str = "cpu"):
     """
     Configure an optimized AdamW optimizer with weight decay split and fused computation.
@@ -986,15 +980,21 @@ def configure_optimizers(model: nn.Module, weight_decay: float, learning_rate: f
     Note:
         Uses fused operations when available on CUDA for better performance
     """
-    param_dict = {pn: p for pn, p in model.named_parameters() if p.requires_grad}
+     # start with all of the candidate parameters (that require grad)
+    param_dict = {pn: p for pn, p in model.named_parameters()}
+    param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
+    
     decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
     nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
-
+    num_decay_params = sum(p.numel() for p in decay_params)
+    num_nodecay_params = sum(p.numel() for p in nodecay_params)
+    log.info(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
+    log.info(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
     optim_groups = [
         {'params': decay_params, 'weight_decay': weight_decay},
         {'params': nodecay_params, 'weight_decay': 0.0}
     ]
-
+    # Create AdamW optimizer and use the fused version if it is available
     fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
     use_fused = fused_available and device_type == "cuda"
     log.info(f"Using fused AdamW: {use_fused}")
@@ -1021,62 +1021,73 @@ def get_lr(step: int, cfg: TrainConfig):
 # =====================================================
 # === Training Loop (AMP, gradclip, LR schedule) ===
 # =====================================================
-def train_model(model: nn.Module,
-                train_loader: DataLoader,
-                val_loader: DataLoader,
-                cfg: TrainConfig,
-                asset_index: int = 0):
-    """Train model with early stopping based on validation loss.
-    
-    Args:
-        model: Model to train
-        train_loader: Training data loader
-        val_loader: Validation data loader
-        cfg: Training configuration
-        asset_index: Index of target asset
-        
-    Returns:
-        tuple: (trained model, training losses, validation losses, step numbers)
+def train_model(
+    model: nn.Module,
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    cfg: TrainConfig,
+    asset_index: int = 0,
+    log_interval: int = 10,
+    val_interval: int = 100,
+):
+    """
+    Train the model with early stopping and LR scheduling.
     """
     device = torch.device(cfg.device)
     model = model.to(device)
-
-    opt = configure_optimizers(model, weight_decay=cfg.weight_decay, learning_rate=cfg.learning_rate, device_type=cfg.device)
+    opt = configure_optimizers(
+        model, weight_decay=cfg.weight_decay,
+        learning_rate=cfg.learning_rate,
+        device_type=cfg.device
+    )
     scaler = torch.amp.GradScaler(enabled=(cfg.use_amp and device.type == "cuda"))
+    loss_fn = nn.MSELoss()
 
+    # Training state
     step = 0
-    start_time = time.time()
-    train_loss_history = []
-    val_loss_history = []
-    steps_history = []
-    best_val_loss = float('inf')
+    best_val_loss = float("inf")
     patience_counter = 0
     best_model_state = None
     early_stop = False
 
-    loss_fn = nn.MSELoss()
-    model.train()
-    while step < cfg.max_steps:
-        for batch_idx, (batch_data, batch_timestamps) in enumerate(train_loader):
-            batch_data = batch_data.to(device)
-            batch_timestamps = batch_timestamps.to(device)
-            # true target region: last pred_len timesteps, column asset_index
+    train_losses, val_losses, steps = [], [], []
+    start_time = time.time()
+
+    def evaluate(loader):
+        """Compute mean validation loss."""
+        model.eval()
+        losses = []
+        with torch.no_grad():
+            for data, ts in loader:
+                data, ts = data.to(device), ts.to(device)
+                y_true = data[:, -model.pred_len:, asset_index]
+                y_pred = model(data, ts)
+                losses.append(loss_fn(y_pred, y_true).item())
+        model.train()
+        return float(np.mean(losses)) if losses else float("nan")
+
+    # === Training Loop ===
+    while step < cfg.max_steps and not early_stop:
+        for batch_data, batch_timestamps in train_loader:
+            batch_data, batch_timestamps = batch_data.to(device), batch_timestamps.to(device)
             y_true = batch_data[:, -model.pred_len:, asset_index]
 
-            # schedule lr
+            # Update learning rate
             lr = get_lr(step, cfg)
             for g in opt.param_groups:
-                g['lr'] = lr
+                g["lr"] = lr
 
-            opt.zero_grad()
-            # autocast context
-            autocast_ctx = torch.autocast(device_type=device.type, dtype=torch.float16, 
-                                        enabled=(cfg.use_amp and device.type == "cuda"))
-            with autocast_ctx:
-                y_pred = model(batch_data, batch_timestamps)  # [B, pred_len]
+            # Forward + loss
+            with torch.autocast(
+                device_type=device.type,
+                dtype=torch.float16,
+                enabled=(cfg.use_amp and device.type == "cuda"),
+            ):
+                y_pred = model(batch_data, batch_timestamps)
                 loss = loss_fn(y_pred, y_true)
 
-            # backward + scaling
+            # Backward
+            opt.zero_grad(set_to_none=True)
             if cfg.use_amp and device.type == "cuda":
                 scaler.scale(loss).backward()
                 if cfg.use_grad_clip:
@@ -1090,56 +1101,60 @@ def train_model(model: nn.Module,
                     torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
                 opt.step()
 
-            # logging
-            if step % 10 == 0:
+            # Logging
+            if step % log_interval == 0:
                 elapsed = time.time() - start_time
-                tok_s = (batch_data.shape[0] * batch_data.shape[1]) / max(1e-9, elapsed)
-                log.info(f"step {step} | train loss {loss.item():.6f} | lr {lr:.3e} | tok/s {tok_s:.1f}")
-                train_loss_history.append(loss.item())
-                steps_history.append(step)
+                samples_per_s = batch_data.size(0) / max(elapsed, 1e-9)
+                log.info(
+                    f"[Step {step:5d}] "
+                    f"train_loss={loss.item():.6f} | lr={lr:.3e} | samples/s={samples_per_s:.1f}"
+                )
+                train_losses.append(loss.item())
+                steps.append(step)
                 start_time = time.time()
 
             # Validation
-            if step % 100 == 0 and val_loader is not None:
-                model.eval()
-                val_losses = []
-                with torch.no_grad():
-                    for val_data, val_timestamps in val_loader:
-                        val_data = val_data.to(device)
-                        val_timestamps = val_timestamps.to(device)
-                        vy_true = val_data[:, -model.pred_len:, asset_index]
-                        vy_pred = model(val_data,val_timestamps)  # [B, pred_len]
-                        val_losses.append(loss_fn(vy_pred, vy_true).item())
-                mean_val_loss = float(np.mean(val_losses)) if len(val_losses) > 0 else float('nan')
-                val_loss_history.append((step, mean_val_loss))
-                
-                # Early stopping check
-                if mean_val_loss < best_val_loss - cfg.min_delta:
-                    best_val_loss = mean_val_loss
+            if val_loader and step % val_interval == 0:
+                val_loss = evaluate(val_loader)
+                val_losses.append((step, val_loss))
+                improved = val_loss < (best_val_loss - cfg.min_delta)
+                if improved:
+                    best_val_loss = val_loss
                     patience_counter = 0
-                    # Save best model state
                     best_model_state = {k: v.cpu() for k, v in model.state_dict().items()}
                 else:
                     patience_counter += 1
+                    log.info(
+                        f"[Val {step:5d}] loss={val_loss:.6f} | "
+                        f"best={best_val_loss:.6f} | patience={patience_counter}/{cfg.patience}"
+                    )
                     if patience_counter >= cfg.patience:
-                        log.info(f"Early stopping triggered after {step} steps. Best validation loss: {best_val_loss:.6f}")
-                        # Restore best model state
-                        if best_model_state is not None:
-                            model.load_state_dict(best_model_state)
+                        log.info(f"Early stopping triggered at step {step}.")
                         early_stop = True
                         break
-                
-                log.info(f"step {step} | VALIDATION loss {mean_val_loss:.6f} | best {best_val_loss:.6f} | patience {patience_counter}/{cfg.patience}")
-                model.train()
 
             step += 1
             if step >= cfg.max_steps or early_stop:
                 break
-        
-        if early_stop:
-            break
 
-    return model, train_loss_history, val_loss_history, steps_history
+    # Restore best model
+    if best_model_state is not None:
+        model.load_state_dict(best_model_state)
+
+    return model, train_losses, val_losses, steps, best_val_loss
+
+
+def init_weights(module: nn.Module, std: float = 0.02, n_layer: int = 12):
+    """
+    partial/gpt-style initialization for linear and embedding layers (optional)
+    """
+    if isinstance(module, nn.Linear):
+        nn.init.normal_(module.weight, mean=0.0, std=std)
+        if module.bias is not None:
+            nn.init.zeros_(module.bias)
+    elif isinstance(module, nn.LayerNorm):
+        # layernorm defaults are fine
+        pass
 
 # =====================================================
 # Example configuration/test run when run as script
@@ -1174,7 +1189,9 @@ if __name__ == "__main__":
 
     # training config
     tcfg = TrainConfig(learning_rate=1e-4, weight_decay=0.01, max_steps=10, warmup_steps=1, use_amp=False, device="cpu")
-    model, train_hist, val_hist, steps_hist = train_model(model, train_loader, val_loader, tcfg, asset_index=asset_idx)
+    model, train_hist, val_hist, steps_hist, best_val_loss, best_val_step = train_model(
+        model, train_loader, val_loader, tcfg, asset_index=asset_idx
+    )
 
 
     total_learnable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -1185,10 +1202,11 @@ if __name__ == "__main__":
     preds = []
     targets = []
     with torch.no_grad():
-        for x in val_loader:
-            x = x.to(device)
-            y_pred = model(x)  # [B, pred_len]
-            y_true = x[:, -model.pred_len:, asset_idx]  # [B, pred_len]
+        for val_seqs, val_times in val_loader:
+            val_seqs = val_seqs.to(device)
+            val_times = val_times.to(device)
+            y_pred = model(val_seqs, val_times)  # [B, pred_len]
+            y_true = val_seqs[:, -model.pred_len:, asset_idx]  # [B, pred_len]
             # Append the full predicted sequence, not just last step
             preds.append(y_pred.cpu().numpy())
             targets.append(y_true.cpu().numpy())
