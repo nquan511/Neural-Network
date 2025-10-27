@@ -128,7 +128,7 @@ class Attention(nn.Module):
         out = F.scaled_dot_product_attention(
             Q, K, V,
             dropout_p=dropout_p,
-            is_causal=self.mask_flag
+            is_causal=causal
         )  # [B, H, L_Q, d_k]
 
         # Merge heads and project
@@ -452,12 +452,15 @@ class Encoder(nn.Module):
             EncoderLayer(d_model, n_heads, d_ff, dropout, distill=(distill and i < (n_layers - 1)), factor=factor, norm_mode=norm_mode)
             for i in range(n_layers)
         ])
-        self.n_layers = n_layers
+        if norm_mode == "pre":
+            self.final_norm = nn.LayerNorm(d_model)
+        else:
+            self.final_norm = nn.Identity()
 
     def forward(self, x):
         for layer in self.layers:
             x = layer(x)
-        return x
+        return self.final_norm(x)
 
 class Decoder(nn.Module):
     """
@@ -502,7 +505,11 @@ class Decoder(nn.Module):
             DecoderLayer(d_model, n_heads, d_ff, dropout, factor, norm_mode=norm_mode)
             for _ in range(n_layers)
         ])
-        self.n_layers = n_layers
+        if norm_mode == "pre":
+            self.final_norm = nn.LayerNorm(d_model)
+        else:
+            self.final_norm = nn.Identity()
+
 
     def forward(self, dec, enc):
         seq_len = dec.size(1)
@@ -510,7 +517,7 @@ class Decoder(nn.Module):
         attn_mask = generate_causal_mask(seq_len, device)
         for layer in self.layers:
             dec = layer(dec, enc, attn_mask=attn_mask)
-        return dec
+        return self.final_norm(dec)
 
 # Positional Encoding
 class PositionalEncoding(nn.Module):
@@ -1040,10 +1047,10 @@ def train_model(
                 y_true = data[:, -model.pred_len:, asset_index]
                 y_pred = model(data, ts)
                 losses.append(loss_fn(y_pred, y_true).item())
-        model.train()
         return float(np.mean(losses)) if losses else float("nan")
 
     # === Training Loop ===
+    model.train()
     while step < cfg.max_steps and not early_stop:
         for batch_data, batch_timestamps in train_loader:
             batch_data, batch_timestamps = batch_data.to(device), batch_timestamps.to(device)
@@ -1110,6 +1117,7 @@ def train_model(
                         log.info(f"Early stopping triggered at step {step}.")
                         early_stop = True
                         break
+                model.train()
 
             step += 1
             if step >= cfg.max_steps or early_stop:
