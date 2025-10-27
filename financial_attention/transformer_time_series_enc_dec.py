@@ -94,7 +94,7 @@ class Attention(nn.Module):
         - Output: (batch_size, seq_length, d_model)
         - Attention mask: (seq_length, seq_length) or (batch_size, n_heads, seq_length, seq_length)
     """
-    def __init__(self, d_model, n_heads, attention_dropout=0.1, mask_flag=True):
+    def __init__(self, d_model, n_heads, attention_dropout=0.1, mask_flag=False):
         super().__init__()
         if d_model % n_heads != 0:
             raise ValueError(f"d_model ({d_model}) must be divisible by n_heads ({n_heads})")
@@ -112,54 +112,27 @@ class Attention(nn.Module):
         self.attn_dropout = nn.Dropout(attention_dropout)
         self.out_dropout = nn.Dropout(attention_dropout)
 
-    def forward(self, Q, K, V, attn_mask=None):
+    def forward(self, Q, K, V, attn_mask=None, causal=False):
         # Extract input dimensions
-        # B: batch size, L_Q: query sequence length, D: model dimension
         B, L_Q, D = Q.shape
-        # L_K: key sequence length (same as value sequence length)
         _, L_K, _ = K.shape
 
-        # Multi-head projection and reshaping:
-        # 1. Linear projection to d_model dimensions
-        # 2. Reshape to separate heads: [B, L, D] -> [B, L, H, D/H]
-        # 3. Transpose for attention: [B, L, H, D/H] -> [B, H, L, D/H]
-        # Final shape: [batch_size, n_heads, seq_length, d_k]
+        # Project to multi-head and rearrange to [B, H, L, d_k]
         Q = self.q_proj(Q).view(B, L_Q, self.n_heads, self.d_k).transpose(1, 2)
         K = self.k_proj(K).view(B, L_K, self.n_heads, self.d_k).transpose(1, 2)
         V = self.v_proj(V).view(B, L_K, self.n_heads, self.d_k).transpose(1, 2)
 
-        # Compute attention scores
-        # 1. Matrix multiply Q and K^T: [B, H, L_Q, d_k] @ [B, H, d_k, L_K]
-        # 2. Scale by sqrt(d_k) for stable gradients
-        # Result shape: [batch_size, n_heads, L_Q, L_K]
-        # Compute attention scores with scaling
-        attn_scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.d_k)
+        # Fused scaled dot-product attention (FlashAttention when available)
+        dropout_p = self.attn_dropout.p if self.training else 0.0
+        out = F.scaled_dot_product_attention(
+            Q, K, V,
+            dropout_p=dropout_p,
+            is_causal=causal or self.mask_flag
+        )  # [B, H, L_Q, d_k]
 
-        # Apply attention masking if provided
-        if attn_mask is not None:
-            # Handle different mask shapes:
-            # - 2D mask [L_Q, L_K]: Expand to 4D [1, 1, L_Q, L_K]
-            # - 4D mask [B, H, L_Q, L_K]: Use as is
-            if attn_mask.dim() == 2:
-                attn_mask = attn_mask.unsqueeze(0).unsqueeze(0)
-            # Replace masked positions with -inf before softmax
-            attn_scores = attn_scores.masked_fill(attn_mask == 0, float('-inf'))
-
-        # Compute attention weights:
-        # 1. Apply softmax to get probabilities
-        # 2. Apply dropout for regularization
-        # Shape: [batch_size, n_heads, L_Q, L_K]
-        attn = torch.softmax(attn_scores, dim=-1)
-        attn = self.attn_dropout(attn)
-
-        # Compute output:
-        # 1. Matrix multiply with values: [B, H, L_Q, L_K] @ [B, H, L_K, d_k]
-        # 2. Transpose and reshape back to original dimensions
-        # 3. Project to final output space
-        # 4. Apply output dropout
-        out = torch.matmul(attn, V)  # [B, H, L_Q, d_k]
-        out = out.transpose(1, 2).contiguous().view(B, L_Q, D)  # [B, L_Q, D]
-        out = self.o_proj(out)  # Final projection
+        # Merge heads and project
+        out = out.transpose(1, 2).contiguous().view(B, L_Q, D)
+        out = self.o_proj(out)
         return self.out_dropout(out)
 
 class ProbSparseSelfAttention(Attention):
@@ -933,14 +906,12 @@ class TrainConfig:
         if self.patience < 1:
             raise ValueError("patience must be at least 1")
 
-def _init_weights(module: nn.Module, std: float = 0.02, n_layer: int = 12):
+def init_weights(module: nn.Module, std: float = 0.02):
     """
     partial/gpt-style initialization for linear and embedding layers (optional)
     """
     if isinstance(module, nn.Linear):
         local_std = std
-        if hasattr(module, "NANOGPT_SCALE_INIT") and getattr(module, "NANOGPT_SCALE_INIT"):
-            local_std = std * (2 * n_layer) ** -0.5
         nn.init.normal_(module.weight, mean=0.0, std=local_std)
         if module.bias is not None:
             nn.init.zeros_(module.bias)
