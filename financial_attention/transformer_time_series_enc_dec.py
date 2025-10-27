@@ -94,7 +94,7 @@ class Attention(nn.Module):
         - Output: (batch_size, seq_length, d_model)
         - Attention mask: (seq_length, seq_length) or (batch_size, n_heads, seq_length, seq_length)
     """
-    def __init__(self, d_model, n_heads, attention_dropout=0.1, mask_flag=False):
+    def __init__(self, d_model, n_heads, attention_dropout=0.1, mask_flag=True):
         super().__init__()
         if d_model % n_heads != 0:
             raise ValueError(f"d_model ({d_model}) must be divisible by n_heads ({n_heads})")
@@ -109,8 +109,6 @@ class Attention(nn.Module):
         self.k_proj = nn.Linear(d_model, d_model)
         self.v_proj = nn.Linear(d_model, d_model)
         self.o_proj = nn.Linear(d_model, d_model)
-        # Residual projection: scale init per GPT residual trick
-        self.o_proj.NANOGPT_SCALE_INIT = 1.0
         # Apply dropout to both attention weights and output
         self.attn_dropout = nn.Dropout(attention_dropout)
         self.out_dropout = nn.Dropout(attention_dropout)
@@ -285,11 +283,11 @@ class EncoderLayer(nn.Module):
     1. Self-Attention Block:
        - ProbSparse self-attention for efficient processing
        - Residual connection and dropout
-       - Post-normalization for training stability
+       - Pre/Post-normalization for training stability
        
     2. Feed-Forward Block:
        - Two linear transformations with GELU activation
-       - Post-normalization and residual connection
+       - Pre/Post-normalization and residual connection
        - Dropout for regularization
        
     3. Optional Distillation (if enabled):
@@ -309,7 +307,7 @@ class EncoderLayer(nn.Module):
         - Input: (batch_size, seq_length, d_model)
         - Output: (batch_size, seq_length/2 if distill else seq_length, d_model)
     """
-    def __init__(self, d_model, n_heads, d_ff, dropout=0.1, distill=True, factor=5):
+    def __init__(self, d_model, n_heads, d_ff, dropout=0.1, distill=True, factor=5, norm_mode="pre"):
         super().__init__()
         self.attn = ProbSparseSelfAttention(d_model, n_heads, factor=factor)
         self.ff = nn.Sequential(
@@ -321,6 +319,7 @@ class EncoderLayer(nn.Module):
         self.norm2 = nn.LayerNorm(d_model)
         self.dropout = nn.Dropout(dropout)
         self.distill = distill
+        self.norm_mode = norm_mode  # "pre" or "post"
         if distill:
             self.conv = nn.Sequential(
                 nn.Conv1d(d_model, d_model, kernel_size=3, padding=1),
@@ -329,9 +328,15 @@ class EncoderLayer(nn.Module):
             )
 
     def forward(self, x):
-        norm_x = self.norm1(x)
-        x = x + self.dropout(self.attn(norm_x, norm_x, norm_x))
-        x = x + self.dropout(self.ff(self.norm2(x)))
+        if self.norm_mode == "pre":
+            norm_x = self.norm1(x)
+            x = x + self.dropout(self.attn(norm_x, norm_x, norm_x))
+            x = x + self.dropout(self.ff(self.norm2(x)))
+        else:
+            sa_out = self.attn(x, x, x)
+            x = self.norm1(x + self.dropout(sa_out))
+            ff_out = self.ff(x)
+            x = self.norm2(x + self.dropout(ff_out))
         if self.distill:
             x = self.conv(x.transpose(1, 2)).transpose(1, 2)
         return x
@@ -347,13 +352,13 @@ class DecoderLayer(nn.Module):
     ------------
     1. Masked Self-Attention:
        - ProbSparse self-attention with causal masking
-       - Post-normalization for stability
+       - Pre/Post-normalization for stability
        - Residual connection and dropout
        
     2. Cross-Attention:
        - Standard attention to encoder outputs
        - Enables information flow from encoder
-       - Post-normalization and residual connection
+       - Pre/Post-normalization and residual connection
        
     3. Feed-Forward:
        - Two linear transformations with GELU
@@ -373,7 +378,7 @@ class DecoderLayer(nn.Module):
         - Output: (batch_size, target_length, d_model)
         - Mask: (target_length, target_length)
     """
-    def __init__(self, d_model, n_heads, d_ff, dropout=0.1, factor=5):
+    def __init__(self, d_model, n_heads, d_ff, dropout=0.1, factor=5, norm_mode="pre"):
         super().__init__()
         self.self_attn = ProbSparseSelfAttention(d_model, n_heads, factor=factor)
         self.cross_attn = Attention(d_model, n_heads)
@@ -386,12 +391,21 @@ class DecoderLayer(nn.Module):
         self.norm2 = nn.LayerNorm(d_model)
         self.norm3 = nn.LayerNorm(d_model)
         self.dropout = nn.Dropout(dropout)
+        self.norm_mode = norm_mode  # "pre" or "post"
 
     def forward(self, dec, enc,attn_mask=None):
-        norm_dec_1 = self.norm1(dec)
-        dec = dec + self.dropout(self.self_attn(norm_dec_1, norm_dec_1, norm_dec_1, attn_mask=attn_mask))
-        dec = dec + self.dropout(self.cross_attn(self.norm2(dec), enc, enc))
-        dec = dec + self.dropout(self.ff(self.norm3(dec)))
+        if self.norm_mode == "pre":
+            norm_dec_1 = self.norm1(dec)
+            dec = dec + self.dropout(self.self_attn(norm_dec_1, norm_dec_1, norm_dec_1, attn_mask=attn_mask))
+            dec = dec + self.dropout(self.cross_attn(self.norm2(dec), enc, enc))
+            dec = dec + self.dropout(self.ff(self.norm3(dec)))
+        else:
+            sa_out = self.self_attn(dec, dec, dec, attn_mask=attn_mask)
+            dec = self.norm1(dec + self.dropout(sa_out))
+            ca_out = self.cross_attn(dec, enc, enc)
+            dec = self.norm2(dec + self.dropout(ca_out))
+            ff_out = self.ff(dec)
+            dec = self.norm3(dec + self.dropout(ff_out))
         return dec
 
 class Encoder(nn.Module):
@@ -432,38 +446,18 @@ class Encoder(nn.Module):
         - Input: (batch_size, seq_length, d_model)
         - Output: (batch_size, seq_length/(2^(n_layers-1)) if distill else seq_length, d_model)
     """
-    def __init__(self, d_model, n_heads, d_ff, n_layers, dropout=0.1, distill=True, factor=5):
+    def __init__(self, d_model, n_heads, d_ff, n_layers, dropout=0.1, distill=True, factor=5, norm_mode="pre"):
         super().__init__()
         self.layers = nn.ModuleList([
-            EncoderLayer(d_model, n_heads, d_ff, dropout, distill=(distill and i < (n_layers - 1)), factor=factor)
+            EncoderLayer(d_model, n_heads, d_ff, dropout, distill=(distill and i < (n_layers - 1)), factor=factor, norm_mode=norm_mode)
             for i in range(n_layers)
         ])
-        self.final_norm = nn.LayerNorm(d_model)
         self.n_layers = n_layers
-        #initialize weights
-        self.apply(self._init_weights)
 
     def forward(self, x):
         for layer in self.layers:
             x = layer(x)
-        return self.final_norm(x)
-    
-    def _init_weights(self, module: nn.Module):
-        # standard deviation grows inside the residual connection stream
-        # hence, we scaledown the initialization of the final projection to compensate
-        # 0.02 is the default std used in GPT
-        std = 0.02
-        if isinstance(module, nn.Linear):
-            if hasattr(module, "NANOGPT_SCALE_INIT") and getattr(module, "NANOGPT_SCALE_INIT"):
-                # we use 2 times since we apply 2 residual connections per layer - 
-                # see forward of EncoderLayer class
-                std = std * (2 * self.n_layers) ** -0.5
-            nn.init.normal_(module.weight, mean=0.0, std=std)
-            if module.bias is not None:
-                nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.LayerNorm):
-            # layernorm defaults are fine
-            pass
+        return x
 
 class Decoder(nn.Module):
     """
@@ -502,17 +496,13 @@ class Decoder(nn.Module):
         - Encoder input: (batch_size, source_length, d_model)
         - Output: (batch_size, target_length, d_model)
     """
-    def __init__(self, d_model, n_heads, d_ff, n_layers, dropout=0.1, factor=5):
+    def __init__(self, d_model, n_heads, d_ff, n_layers, dropout=0.1, factor=5, norm_mode="pre"):
         super().__init__()
         self.layers = nn.ModuleList([
-            DecoderLayer(d_model, n_heads, d_ff, dropout, factor)
+            DecoderLayer(d_model, n_heads, d_ff, dropout, factor, norm_mode=norm_mode)
             for _ in range(n_layers)
         ])
-        self.final_norm = nn.LayerNorm(d_model)
         self.n_layers = n_layers
-
-        #initialize weights
-        self.apply(self._init_weights)
 
     def forward(self, dec, enc):
         seq_len = dec.size(1)
@@ -520,23 +510,7 @@ class Decoder(nn.Module):
         attn_mask = generate_causal_mask(seq_len, device)
         for layer in self.layers:
             dec = layer(dec, enc, attn_mask=attn_mask)
-        return self.final_norm(dec)
-    
-    def _init_weights(self, module: nn.Module):
-        # standard deviation grows inside the residual connection stream
-        # hence, we scaledown the initialization of the final projection to compensate
-        std = 0.02
-        if isinstance(module, nn.Linear):
-            if hasattr(module, "NANOGPT_SCALE_INIT") and getattr(module, "NANOGPT_SCALE_INIT"):
-                # we use 3 times since we apply 3 residual connections per layer - 
-                # see forward of DecoderLayer class
-                std = std * (3 * self.n_layers) ** -0.5
-            nn.init.normal_(module.weight, mean=0.0, std=std)
-            if module.bias is not None:
-                nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.LayerNorm):
-            # layernorm defaults are fine
-            pass
+        return dec
 
 # Positional Encoding
 class PositionalEncoding(nn.Module):
@@ -625,6 +599,8 @@ class InformerForecaster(nn.Module):
         self.distill = config["distill"]
         self.factor = config["factor"]
         self.use_time_embedding = config.get("use_time_embedding", False)
+        # LayerNorm placement: "pre" (norm-first) or "post" (norm-last)
+        self.norm_mode = config.get("norm_mode", "pre")
 
         # Input embeddings
         self.enc_embedding = nn.Linear(self.d_input, self.d_model)
@@ -642,11 +618,11 @@ class InformerForecaster(nn.Module):
         # Transformer backbone
         self.encoder = Encoder(
             self.d_model, self.n_heads, self.d_ff, self.enc_layers,
-            dropout=self.dropout, distill=self.distill, factor=self.factor
+            dropout=self.dropout, distill=self.distill, factor=self.factor, norm_mode=self.norm_mode
         )
         self.decoder = Decoder(
             self.d_model, self.n_heads, self.d_ff, self.dec_layers,
-            dropout=self.dropout, factor=self.factor
+            dropout=self.dropout, factor=self.factor, norm_mode=self.norm_mode
         )
 
         # Output projection
@@ -1046,6 +1022,7 @@ def train_model(
     # Training state
     step = 0
     best_val_loss = float("inf")
+    best_val_step = 0
     patience_counter = 0
     best_model_state = None
     early_stop = False
@@ -1087,7 +1064,7 @@ def train_model(
                 loss = loss_fn(y_pred, y_true)
 
             # Backward
-            opt.zero_grad(set_to_none=True)
+            opt.zero_grad()
             if cfg.use_amp and device.type == "cuda":
                 scaler.scale(loss).backward()
                 if cfg.use_grad_clip:
@@ -1120,6 +1097,7 @@ def train_model(
                 improved = val_loss < (best_val_loss - cfg.min_delta)
                 if improved:
                     best_val_loss = val_loss
+                    best_val_step = step
                     patience_counter = 0
                     best_model_state = {k: v.cpu() for k, v in model.state_dict().items()}
                 else:
@@ -1141,10 +1119,10 @@ def train_model(
     if best_model_state is not None:
         model.load_state_dict(best_model_state)
 
-    return model, train_losses, val_losses, steps, best_val_loss
+    return model, train_losses, val_losses, steps, best_val_loss, best_val_step
 
 
-def init_weights(module: nn.Module, std: float = 0.02, n_layer: int = 12):
+def init_weights(module: nn.Module, std: float = 0.02):
     """
     partial/gpt-style initialization for linear and embedding layers (optional)
     """
