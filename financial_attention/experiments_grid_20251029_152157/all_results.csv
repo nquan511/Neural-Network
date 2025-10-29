@@ -1,0 +1,3 @@
+Experiment no,d_model,d_ff,distill,time embedding,dropout,learnable params,Best Val Step,train loss,best validation loss,jaggedness_ratio (pred/real),MSE,MAE
+d64_nodist_notime_drop0.05prenorm,64,256,False,False,0.050000,285185,3500,0.002495,0.004764,1.100800,0.008700,0.075500
+d64_nodist_notime_drop0.05postnorm,64,256,False,False,0.050000,284929,4100,0.001828,0.002431,0.805600,0.001200,0.027500

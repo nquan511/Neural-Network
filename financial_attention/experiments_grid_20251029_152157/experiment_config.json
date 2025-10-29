@@ -1,0 +1,37 @@
+{
+    "timestamp": "20251029_152838",
+    "total_experiments": 2,
+    "parameter_grid": {
+        "d_model": [
+            64
+        ],
+        "distill": [
+            false
+        ],
+        "use_time_embedding": [
+            false
+        ],
+        "dropout": [
+            0.05
+        ],
+        "norm_mode": [
+            "pre",
+            "post"
+        ]
+    },
+    "base_config": {
+        "d_input": 10,
+        "n_heads": 4,
+        "enc_layers": 3,
+        "dec_layers": 2,
+        "enc_len": 96,
+        "guiding_len": 48,
+        "pred_len": 24,
+        "factor": 5,
+        "d_ff": 256
+    },
+    "experiment_names": [
+        "d64_nodist_notime_drop0.05prenorm",
+        "d64_nodist_notime_drop0.05postnorm"
+    ]
+}

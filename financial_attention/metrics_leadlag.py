@@ -71,6 +71,7 @@ def lead_lag_grid(
     max_lag: int = 24,
     return_kind: str = "diff",
     min_abs_return: Optional[float] = None,
+    min_n: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Compute lead–lag metrics across lags in [-max_lag, ..., +max_lag].
 
@@ -83,6 +84,13 @@ def lead_lag_grid(
     """
     r_true = _to_returns(np.asarray(y_true_prices).ravel(), kind=return_kind)
     r_pred = _to_returns(np.asarray(y_pred_prices).ravel(), kind=return_kind)
+
+    # Default minimum N for selecting best lag
+    R = min(len(r_true), len(r_pred))
+    if min_n is None:
+        min_n = max(3, int(0.25 * R))
+    # Clamp to valid range
+    min_n = int(max(1, min(min_n, R)))
 
     lags = np.arange(-max_lag, max_lag + 1)
     hit = np.zeros_like(lags, dtype=float)
@@ -113,14 +121,16 @@ def lead_lag_grid(
             ci_low[i] = p - 1.96 * se
             ci_high[i] = p + 1.96 * se
 
-    # summaries
-    def _best_idx(x: np.ndarray) -> int:
-        if not np.any(np.isfinite(x)):
+    # summaries with minimum-N filter
+    def _best_idx_with_min_n(x: np.ndarray, n_used_arr: np.ndarray, min_n_val: int) -> int:
+        mask = np.isfinite(x) & (n_used_arr >= min_n_val)
+        if not np.any(mask):
             return -1
-        return int(np.nanargmax(x))
+        x_masked = np.where(mask, x, -np.inf)
+        return int(np.nanargmax(x_masked))
 
-    idx_best_hit = _best_idx(hit)
-    idx_best_corr = _best_idx(corr)
+    idx_best_hit = _best_idx_with_min_n(hit, n_used, min_n)
+    idx_best_corr = _best_idx_with_min_n(corr, n_used, min_n)
     best = {
         "best_lag_by_hit": int(lags[idx_best_hit]) if idx_best_hit >= 0 else None,
         "best_hit_ratio": float(hit[idx_best_hit]) if idx_best_hit >= 0 else np.nan,
@@ -129,6 +139,7 @@ def lead_lag_grid(
         "best_corr": float(corr[idx_best_corr]) if idx_best_corr >= 0 else np.nan,
         "zero_lag_hit": float(hit[lags == 0][0]) if np.any(lags == 0) else np.nan,
         "zero_lag_corr": float(corr[lags == 0][0]) if np.any(lags == 0) else np.nan,
+        "min_n": int(min_n),
     }
 
     return {
@@ -148,7 +159,8 @@ def lead_lag_report(metrics: Dict[str, Any]) -> str:
     lag_hit = s.get("best_lag_by_hit")
     lag_corr = s.get("best_lag_by_corr")
     txt = []
-    txt.append("Lead–Lag Summary")
+    # Use ASCII hyphen to avoid encoding issues across platforms
+    txt.append("Lead-Lag Summary")
     if lag_hit is not None:
         txt.append(
             f"- Best lag by directional hit: {lag_hit} (pred leads if >0). Hit={s.get('best_hit_ratio'):.3f}, N={s.get('best_hit_n')}"
@@ -161,6 +173,8 @@ def lead_lag_report(metrics: Dict[str, Any]) -> str:
         txt.append(f"- Zero-lag hit ratio: {s.get('zero_lag_hit'):.3f}")
     if "zero_lag_corr" in s:
         txt.append(f"- Zero-lag return corr: {s.get('zero_lag_corr'):.3f}")
+    if "min_n" in s:
+        txt.append(f"- Minimum N considered for best-lag selection: {s.get('min_n')}")
     return "\n".join(txt)
 
 
@@ -216,4 +230,3 @@ def plot_lead_lag(metrics: Dict[str, Any], use_plotly: bool = True):
     ax1.legend(lines + lines2, labels + labels2, loc="lower right")
     fig.tight_layout()
     return fig
-

@@ -1,0 +1,6 @@
+Lead-Lag Summary
+- Best lag by directional hit: 0 (pred leads if >0). Hit=0.783, N=23
+- Best lag by return correlation: 0 (pred leads if >0). Corr=0.781
+- Zero-lag hit ratio: 0.783
+- Zero-lag return corr: 0.781
+- Minimum N considered for best-lag selection: 5
