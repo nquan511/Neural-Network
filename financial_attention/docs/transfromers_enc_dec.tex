@@ -1,0 +1,672 @@
+\documentclass[11pt]{article}
+\usepackage{amsmath,amsfonts,amssymb,bm,bbm}
+\usepackage{mathtools}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{geometry}
+\geometry{margin=1in}
+\usepackage{physics}
+\usepackage{enumitem}
+
+\title{\textbf{Mathematical Note on Informer-Style Transformer with ProbSparse Self-Attention and Distillation}}
+\author{Quan Nguyen}
+\date{}
+
+\begin{document}
+\maketitle
+
+\tableofcontents
+\vspace{1em}
+
+\section{Problem Setup and Notation}
+
+Let $(x_t)_{t \in \mathbb{Z}}$ denote a multivariate time series with
+\[
+x_t \in \mathbb{R}^{d_{\text{in}}}, \qquad t = 1, 2, \ldots, T.
+\]
+Our goal is to learn a forecasting model that predicts the next $L_p$ steps
+of a chosen target coordinate $a \in \{1, \ldots, d_{\text{in}}\}$ using the past $L_e$ observations and any known future covariates.
+
+Formally, we aim to approximate
+\[
+\hat{y}_{t+1:t+L_p}
+= f_{\theta}\!\left(
+X_{t-L_e+1:t},\,
+\tilde{X}_{t-L_g+1:t+L_p}
+\right)
+\approx (x^{(a)}_{t+1}, \ldots, x^{(a)}_{t+L_p}),
+\]
+where:
+\begin{itemize}
+    \item $X_{t-L_e+1:t} \in \mathbb{R}^{L_e \times d_{\text{in}}}$ is the encoder input sequence,
+    \item $\tilde{X}_{t-L_g+1:t+L_p} \in \mathbb{R}^{(L_g + L_p) \times d_{\text{in}}}$ is the decoder input, obtained by concatenating:
+    \begin{align*}
+        &\text{(i) the overlap context } X_{t-L_g+1:t}, \\
+        &\text{(ii) the masked future segment } \mathrm{MaskFuture}(X_{t+1:t+L_p}; a),
+    \end{align*}
+    where $\mathrm{MaskFuture}(\cdot; a)$ zeroes out the target coordinate $x^{(a)}$ while keeping all other known future features unchanged.
+\end{itemize}
+
+\paragraph{Encoder--decoder structure.}
+The model comprises:
+\begin{itemize}
+    \item \textbf{Encoder window ($L_e$):} the number of past observations used to encode historical information up to time $t$.
+    \item \textbf{Guiding window ($L_g$):} an overlap region shared between encoder and decoder, corresponding to the most recent $L_g$ steps of the encoder output. This overlap provides temporal continuity at the prediction boundary and stabilises decoder dynamics by allowing attention to the latest context.
+    \item \textbf{Prediction horizon ($L_p$):} the number of future steps to forecast for the target variable.
+\end{itemize}
+
+\paragraph{Feature space and per-layer lengths.}
+All hidden representations lie in a shared latent space $\mathbb{R}^{d_{\text{model}}}$.
+Multi-head attention uses $n_{\text{heads}}$ parallel heads, each of per-head dimension
+\[
+d_k = \frac{d_{\text{model}}}{n_{\text{heads}}}.
+\]
+We denote by $L_l$ the sequence length \emph{entering} encoder layer $l$; with distillation enabled, $L_{l} \approx L_{l-1}/2$ (otherwise $L_l=L_0=L_e$ for all $l$). We write $L'_e$ for the encoder output length after the entire stack.
+
+\section{Embedding and Temporal Encoding}
+
+\subsection{Content Embedding}
+Each input vector $x_t\in\mathbb{R}^{d_{\text{in}}}$ is projected to the model space by
+\[
+E(x_t) = x_t W_E + b_E,
+\quad
+W_E \in \mathbb{R}^{d_{\text{in}}\times d_{\text{model}}},\; b_E\in\mathbb{R}^{d_{\text{model}}}.
+\]
+For a batch of size $B$ and sequence length $L$, this yields
+\[
+E(X)\in\mathbb{R}^{B\times L\times d_{\text{model}}}.
+\]
+
+\subsection{Positional Encoding}\label{subsec:positional-encoding}
+
+Self-attention is inherently permutation-invariant: it treats its input sequence as a set rather than an ordered list.
+To enable the model to exploit the sequential structure of the data, we inject information about token positions by adding a positional encoding to the token embeddings before attention layers.
+
+We adopt the deterministic sinusoidal positional encoding, defined as
+\[
+\text{PE}(p,2i)   = \sin\!\left(\frac{p}{10000^{2i/d_{\text{model}}}}\right),\qquad
+\text{PE}(p,2i+1) = \cos\!\left(\frac{p}{10000^{2i/d_{\text{model}}}}\right),
+\]
+for positions \(p = 0, \dots, L_{\max}-1\) and dimensions \(i = 0, \dots, d_{\text{model}}/2 - 1\).
+The encoded input to the transformer is then
+\[
+X_{\text{pos}} = E(X) + \text{PE}[:, :L, :], \qquad X_{\text{pos}}\in\mathbb{R}^{B\times L\times d_{\text{model}}}.
+\]
+
+The sinusoidal design has several appealing properties:
+\begin{itemize}
+    \item \textbf{Deterministic and parameter-free:} no extra parameters, aiding stability and extrapolation to longer sequences.
+    \item \textbf{Multi-scale representation of position:} exponentially spaced frequencies allow both long- and short-wavelength components; relative offsets are linearly recoverable.
+    \item \textbf{Smooth and continuous:} nearby positions produce similar vectors, providing a continuous notion of locality.
+\end{itemize}
+
+\paragraph{Comparison with learned positional embeddings.}
+Learned positional embeddings can capture task-specific patterns but may extrapolate poorly to unseen lengths. The sinusoidal scheme offers a fixed, continuous function of position that generalises naturally and is particularly effective in sequence modelling and time-series settings.
+
+\subsection{Learnable Time Embedding (Optional)}
+
+Many time series contain strong calendar-based patterns such as hourly, daily, or monthly seasonality.
+To incorporate such temporal information, we introduce learnable embeddings for discrete time components.
+
+\paragraph{Discrete time features.}
+For each timestamp $t$:
+\[
+h_t \in \{0, 1, \ldots, 23\}, \qquad
+w_t \in \{0, 1, \ldots, 6\}, \qquad
+m_t \in \{1, 2, \ldots, 12\},
+\]
+representing \emph{hour of day}, \emph{day of week}, and \emph{month of year}.
+
+Each component is passed through a separate embedding table:
+\[
+e_h = \text{Embed}_{24}(h_t), \qquad
+e_w = \text{Embed}_{7}(w_t), \qquad
+e_m = \text{Embed}_{12}(m_t),
+\]
+where $e_h, e_w, e_m \in \mathbb{R}^{d_t}$ and $d_t$ (e.g.\ 8 or 16) is the time-embedding dimension.
+
+\paragraph{Concatenation and projection.}
+Concatenate and project into model space:
+\[
+e_{\text{time}} = \mathrm{concat}(e_h, e_w, e_m) W_1 + b_1,
+\qquad
+W_1 \in \mathbb{R}^{3d_t \times d_{\text{model}}}, \;
+b_1 \in \mathbb{R}^{d_{\text{model}}}.
+\]
+Thus, $e_{\text{time}} \in \mathbb{R}^{d_{\text{model}}}$.
+
+\paragraph{Nonlinear refinement.}
+A lightweight feed-forward transform:
+\[
+e'_{\text{time}} = \text{ReLU}(e_{\text{time}}) W_2 + b_2,
+\qquad
+W_2 \in \mathbb{R}^{d_{\text{model}} \times d_{\text{model}}}, \;
+b_2 \in \mathbb{R}^{d_{\text{model}}}.
+\]
+
+\paragraph{Integration with positional encoding.}
+Combine with positionally encoded input:
+\[
+Z = \text{LayerNorm}\big( X_{\text{pos}} + e'_{\text{time}} \big),
+\]
+with $X_{\text{pos}} \in \mathbb{R}^{B\times L \times d_{\text{model}}}$ broadcast with $e'_{\text{time}}$ across time.
+
+\section{Multi-Head Attention}
+
+Given $Q,K,V\in\mathbb{R}^{B\times L\times d_{\text{model}}}$, attention uses $n_{\text{heads}}$ projections:
+\begin{align}
+Q_h &= Q W_h^Q,\quad K_h = K W_h^K,\quad V_h = V W_h^V,\\
+W_h^{Q,K,V} &\in \mathbb{R}^{d_{\text{model}}\times d_k}, \quad d_k = d_{\text{model}}/n_{\text{heads}}.
+\end{align}
+After reshaping, $Q_h,K_h,V_h\in\mathbb{R}^{B\times n_{\text{heads}}\times L\times d_k}$.
+
+Let $L_Q$ and $L_K$ denote query and key sequence lengths (typically $L_Q=L_K=L$).
+Let $M\in\{0,1\}^{L_Q\times L_K}$ be an optional attention mask, where $M_{ij}=0$ indicates a disallowed (masked) key for query position $i$.
+The scaled dot-product attention per head is
+\[
+A_h(Q,K,V;M)
+= \mathrm{Softmax}\!\left(\frac{Q_hK_h^\top}{\sqrt{d_k}} + \Xi\right)V_h,
+\]
+where $\Xi_{ij}=0$ if $M_{ij}=1$ and $\Xi_{ij}=-\infty$ if $M_{ij}=0$ (i.e.\ masked positions contribute zero probability after softmax). Outputs from all heads are concatenated and projected:
+\[
+\text{MultiHead}(Q,K,V;M)
+= \big[\!A_1;\dots;A_{n_{\text{heads}}}\!\big] W^O,
+\quad
+W^O\in\mathbb{R}^{(n_{\text{heads}}d_k)\times d_{\text{model}}}.
+\]
+\paragraph{Implementation note.}
+In code, we implement this operation using PyTorch’s fused routine
+\texttt{torch.nn.functional.scaled\_dot\_product\_attention},
+which internally supports dropout and causal masking
+and automatically dispatches to FlashAttention kernels when available.
+
+
+\section{ProbSparse Self-Attention}\label{sec:probsparse}
+
+Standard scaled dot-product attention requires $O(L^2)$ computation and memory,
+where $L$ is the sequence length.
+The \emph{ProbSparse} mechanism reduces this to $O(L\log L)$
+by computing attention only for a subset of \emph{dominant} queries—those with peaked attention distributions.
+
+\subsection{Query Sampling and Sparsity Measure}
+
+Let $Q, K, V \in \mathbb{R}^{B \times n_{\text{heads}} \times L \times d_k}$ denote the per-head tensors.
+To estimate which queries are most informative, sample a subset of keys
+$\Pi \subset \{1, \ldots, L\}$ of size
+\[
+k = \lfloor \alpha \log L \rfloor,
+\]
+with tuning factor $\alpha>0$ controlling sparsity (we use the same $\alpha$ for all heads and layers).
+
+For each query position $i\in\{1,\dots,L\}$, compute sampled scores:
+\[
+S_{ij}^{(\text{samp})}
+= \frac{\langle Q_i, K_j \rangle}{\sqrt{d_k}},
+\qquad j \in \Pi.
+\]
+Define the \emph{sparsity score}:
+\[
+s_i =
+\log \sum_{j \in \Pi} \exp(S_{ij}^{(\text{samp})})
+- \frac{1}{k} \sum_{j \in \Pi} S_{ij}^{(\text{samp})}.
+\]
+Large $s_i$ indicates a high-variance, peaked attention distribution.
+
+\paragraph{Implementation note.}
+In practice, the key subset $\Pi$ is sampled uniformly without replacement (e.g.\ \texttt{torch.randperm}),
+and the sparsity score is computed as $\log\!\sum\exp(S_{i\Pi}) - \mathrm{mean}(S_{i\Pi})$ for numerical stability.
+Select the top
+\[
+u = \lfloor \alpha \log L \rfloor
+\]
+queries with the largest $s_i$ to form the dominant set
+$\mathcal{I} = \mathrm{Top}_u(s_1, \dots, s_L)$.
+
+\subsection{Sparse Computation}
+
+The output context tensor $C$ is constructed in three stages:
+
+\begin{enumerate}[label=(\alph*)]
+    \item \textbf{Initialization.}
+    All queries start with a coarse global context given by the mean of values:
+    \[
+    C_i^{(0)} = \frac{1}{L}\sum_{j=1}^L V_j.
+    \]
+    Here $V \in \mathbb{R}^{B \times n_{\text{heads}} \times L \times d_k}$ is the value tensor,
+    and $V_j$ denotes the $j$-th value vector along the sequence dimension.
+
+    \item \textbf{Selective attention.}
+    For dominant queries $i \in \mathcal{I}$, replace $C_i^{(0)}$ by a full attention update:
+    \[
+    C_i =
+    \mathrm{Softmax}\!\left(
+    \frac{Q_i K^\top}{\sqrt{d_k}}
+    \right) V.
+    \]
+
+    \item \textbf{Aggregation.}
+    Write the updated $C_i$ for $i \in \mathcal{I}$ back into $C \in \mathbb{R}^{B \times n_{\text{heads}} \times L \times d_k}$,
+    then concatenate heads and project as in standard multi-head attention.
+\end{enumerate}
+
+\subsection{Complexity and Memory Analysis}
+
+Per head, the total cost is
+\[
+O(L k d_k + u L d_k) = O(L \log L\, d_k),
+\]
+compared to $O(L^2 d_k)$ for dense attention.
+Memory drops from $O(L^2)$ to $O(L(k + u)) = O(L \log L)$.
+
+\paragraph{Why It Works.}
+In many time series, attention maps are sparse: each query focuses on a few influential historical positions.
+For near-uniform queries, replacing their context by the mean introduces minimal error;
+for sharp queries, the sparsity score $s_i$ grows large with high probability under random-key sampling.
+Thus, dominant queries are captured in $\mathcal{I}$ with probability $1 - O(1/L)$.
+
+\paragraph{Limitations.}
+If true attention is dense, the mean-context approximation is inaccurate, and ProbSparse may underperform full attention.
+Increasing $\alpha$ increases $k$ and $u$, improving accuracy at higher compute cost.
+
+\section{Encoder Layer with Distillation}
+\label{sec:encoder-distill}
+
+Each encoder layer $l$ receives a hidden representation
+\[
+H^{(l-1)} \in \mathbb{R}^{B \times L_{l-1} \times d_{\text{model}}},
+\]
+and outputs $H^{(l)} \in \mathbb{R}^{B \times L_{l} \times d_{\text{model}}}$.
+With distillation disabled, $L_l=L_0=L_e$ for all $l$.
+With distillation enabled, $L_l \approx L_{l-1}/2$ (pooling defined below).
+
+\subsection{Computation (Pre-Norm Form)}
+
+The encoder layer follows the standard pre-normalised Transformer structure:
+\begin{align}
+Z_1 &= \mathrm{LN}(H^{(l-1)}), \\
+H' &= H^{(l-1)} + \mathrm{Drop}\!\big(\mathrm{PSA}(Z_1, Z_1, Z_1)\big), \\
+Z_2 &= \mathrm{LN}(H'), \\
+H^{(l)} &= H' + \mathrm{Drop}\!\big(\mathrm{FFN}(Z_2)\big),
+\end{align}
+where $\mathrm{PSA}(\cdot)$ is \textbf{ProbSparse self-attention} (Section~\ref{sec:probsparse}; no mask in the encoder), and $\mathrm{FFN}$ is position-wise:
+\[
+\mathrm{FFN}(x) = \mathrm{GELU}(xW_1 + b_1)W_2 + b_2,
+\qquad
+W_1 \in \mathbb{R}^{d_{\text{model}} \times d_{\text{ff}}},
+\quad
+W_2 \in \mathbb{R}^{d_{\text{ff}} \times d_{\text{model}}}.
+\]
+Residual connections and layer normalisation stabilise gradient flow and preserve feature scale.
+
+\subsection{Convolutional Distillation Block}
+
+If the encoder stack is configured with \texttt{distill=True},
+a convolution--pooling module is inserted after each encoder layer (except the last).
+This block performs temporal compression while retaining channel dimensionality:
+\[
+H^{(l)} \;\longmapsto\; H^{(l+1)}_{\text{pool}}.
+\]
+It consists of two operations:
+a 1D convolution for local temporal feature extraction,
+and a MaxPool1D operator for nonlinear downsampling.
+
+\subsubsection{Conv1D Layer: Local Temporal Feature Extraction}
+
+Given $H^{(l)} \in \mathbb{R}^{B\times L\times d_{\text{model}}}$,
+transpose to channel-first:
+\[
+Z = \mathrm{Transpose}(H^{(l)}, (0,2,1)) \in \mathbb{R}^{B\times C\times L},
+\quad C = d_{\text{model}}.
+\]
+Apply a 1D convolution with kernel $k_c=3$, stride $s_c=1$, padding $p_c=1$:
+\[
+U = \mathrm{Conv1D}(Z; k_c, s_c, p_c)
+    = Z * W_{\text{conv}} + b_{\text{conv}},
+\]
+with
+\[
+W_{\text{conv}} \in \mathbb{R}^{C\times C\times k_c}, 
+\qquad b_{\text{conv}} \in \mathbb{R}^{C}.
+\]
+
+\paragraph{Output length.}
+For input length $L$,
+\[
+L_{\text{conv}} =
+\Big\lfloor \frac{L + 2p_c - (k_c - 1) - 1}{s_c} \Big\rfloor + 1
+= L,
+\]
+so the convolution preserves length.
+
+\paragraph{Index-level formula.}
+Let $Z_{\text{pad}}\in\mathbb{R}^{B\times C\times(L+2p_c)}$ be the zero-padded input.
+For batch $b$, channel $c$, temporal index $t$:
+\[
+U[b,c,t] = 
+\sum_{j=0}^{k_c-1}\sum_{c'=1}^{C}
+Z_{\text{pad}}[b,c',t+j]\,W_{\text{conv}}[c,c',j]
++ b_{\text{conv}}[c].
+\]
+
+\paragraph{Activation.}
+Apply a pointwise nonlinearity (e.g.\ ReLU or ELU):
+\[
+\tilde{U} = \phi(U),
+\quad
+\phi(x)=\max(0,x)\ \text{or}\ 
+\phi(x)=\begin{cases}x,&x>0,\\ e^x-1,&x\le0.\end{cases}
+\]
+
+\subsubsection{MaxPool1D Layer: Nonlinear Temporal Downsampling}
+
+\paragraph{Input and parameters.}
+\[
+\tilde{U} \in \mathbb{R}^{B\times C\times L_{\text{conv}}},
+\quad
+V = \mathrm{MaxPool1D}(\tilde{U}; k_p=3, s_p=2, p_p=1)
+   \in \mathbb{R}^{B\times C\times L_{\text{out}}}.
+\]
+
+\paragraph{Output length.}
+\[
+L_{\text{out}} =
+\Big\lfloor \frac{L_{\text{conv}} + 2p_p - (k_p - 1) - 1}{s_p} \Big\rfloor + 1
+= \Big\lceil \frac{L}{2} \Big\rceil.
+\]
+
+\paragraph{Index-level definition.}
+Let $\tilde{U}_{\text{pad}}\in\mathbb{R}^{B\times C\times(L_{\text{conv}}+2p_p)}$ be the padded input.
+For temporal index $u$:
+\[
+W_u = \{s_p u, s_p u+1, \ldots, s_p u+k_p-1\},\quad
+V[b,c,u] = \max_{j\in W_u} \tilde{U}_{\text{pad}}[b,c,j].
+\]
+
+\paragraph{Gradient flow.}
+During backpropagation, only the maximal element in each window receives gradient:
+\[
+\frac{\partial V[b,c,u]}{\partial \tilde{U}[b,c,j]} =
+\begin{cases}
+1, & j = \arg\max_{k\in W_u}\tilde{U}[b,c,k],\\
+0, & \text{otherwise.}
+\end{cases}
+\]
+
+\paragraph{Interpretation.}
+\begin{itemize}
+  \item \textbf{Dominance-based selection:} keeps the most salient activation in each local window.
+  \item \textbf{Translation robustness:} small timing shifts do not alter the pooled value.
+  \item \textbf{Noise suppression:} weak activations vanish; dominant responses remain.
+  \item \textbf{Information bottleneck:} nonlinear projection
+  $P:\mathbb{R}^{B\times C\times L} \!\to\! \mathbb{R}^{B\times C\times L/2}$,
+  compressing redundancy while preserving core activations.
+\end{itemize}
+
+\subsubsection{Output and Hierarchical Representation}
+
+Transpose back to $(B,L,C)$:
+\[
+H^{(l+1)} = \mathrm{Transpose}(V,(0,2,1))
+             \in \mathbb{R}^{B\times L_{\text{out}}\times d_{\text{model}}}.
+\]
+Thus, $L_{l} \approx L_{l-1}/2$ while $d_{\text{model}}$ remains constant.
+The convolution--pooling pair forms a temporal pyramid:
+\[
+H^{(0)} 
+  \xrightarrow[\text{Conv+Pool}]{}
+H^{(1)} 
+  \xrightarrow[\text{Conv+Pool}]{}
+H^{(2)}
+  \xrightarrow[\text{Conv+Pool}]{}
+\cdots,
+\]
+progressively shortening the sequence while enriching temporal abstraction.
+
+\paragraph{Intuitive summary.}
+Conv1D linearly \emph{aggregates} local temporal context; MaxPool1D nonlinearly \emph{selects} dominant activations; together, they perform hierarchical \emph{temporal distillation}. This reduces compute in deeper layers and provides multi-scale receptive fields.
+
+\paragraph{Learnable parameters.}
+All convolutional parameters $\{W_{\text{conv}}, b_{\text{conv}}\}$ are trained jointly with attention and feed-forward weights. Pooling is parameter-free but participates in backpropagation.
+
+\section{Decoder Layer and Causal Masking}
+
+Each decoder layer receives
+\[
+D^{(l-1)} \in \mathbb{R}^{B \times L_d \times d_{\text{model}}},
+\]
+and attends to the encoder output
+\[
+E \in \mathbb{R}^{B \times L'_e \times d_{\text{model}}}.
+\]
+
+\subsection{Masked Self-Attention}
+
+To ensure autoregressive generation, apply a lower-triangular mask:
+\[
+M_{ij} = \mathbbm{1}_{\{i \ge j\}},
+\qquad
+M \in \{0,1\}^{L_d \times L_d}.
+\]
+Here $M_{ij}=1$ (visible) means position $i$ can attend to position $j$, while $M_{ij}=0$ (masked) prevents access to future positions $j>i$. The mask is broadcast across all heads.
+
+For $L_d=5$:
+\[
+M =
+\begin{bmatrix}
+1 & 0 & 0 & 0 & 0\\
+1 & 1 & 0 & 0 & 0\\
+1 & 1 & 1 & 0 & 0\\
+1 & 1 & 1 & 1 & 0\\
+1 & 1 & 1 & 1 & 1
+\end{bmatrix}.
+\]
+\paragraph{Implementation note.}
+In practice, the causal mask is stored as a boolean tensor of shape $(L_d, L_d)$
+where \texttt{True} indicates a visible (unmasked) position and \texttt{False} indicates a masked one.
+Before the softmax operation, logits corresponding to \texttt{False} entries are assigned $-\infty$,
+so their attention weights vanish after normalization.
+
+
+The decoder layer computation (pre-norm) is:
+\begin{align}
+D_1 &= D^{(l-1)} 
+    + \mathrm{Drop}\!\left(
+        \mathrm{PSA}\big(
+            \mathrm{LN}(D^{(l-1)}),
+            \mathrm{LN}(D^{(l-1)}),
+            \mathrm{LN}(D^{(l-1)});\, M
+        \big)
+      \right),\\[4pt]
+D_2 &= D_1 
+    + \mathrm{Drop}\!\left(
+        \mathrm{MHA}\big(
+            \mathrm{LN}(D_1), 
+            E, 
+            E
+        \big)
+      \right),\\[4pt]
+D^{(l)} &= D_2 
+    + \mathrm{Drop}\!\left(
+        \mathrm{FFN}\big(\mathrm{LN}(D_2)\big)
+      \right).
+\end{align}
+Here, $\mathrm{PSA}$ denotes \emph{masked} ProbSparse self-attention (Section~\ref{sec:probsparse}) using the causal mask $M$, and $\mathrm{MHA}$ denotes standard multi-head \emph{cross}-attention attending to the encoder output $E$ (no causal mask between decoder and encoder).
+
+\paragraph{Causal semantics.}
+The mask enforces
+\[
+p(y_{t+1:t+L_p}\mid x_{1:t})
+= \prod_{h=1}^{L_p} p(y_{t+h}\mid y_{t+1:t+h-1},\, x_{1:t}).
+\]
+Implementation-wise, masked logits are set to $-\infty$ so their softmax probabilities vanish.
+
+\section{End-to-End Flow}
+
+For batch size $B$:
+
+\begin{enumerate}[leftmargin=2em]
+\item Encoder input $X_{\text{enc}}\in\mathbb{R}^{B\times L_e\times d_{\text{in}}}$
+$\to$ embedding + positional/time encoding
+$\to H^{(0)}\in\mathbb{R}^{B\times L_e\times d_{\text{model}}}$.
+
+\item Encoder stack (with optional distillation)
+$\to H^{(N_e)}\in\mathbb{R}^{B\times L'_e\times d_{\text{model}}}$.
+
+\item Decoder input (context $L_g$ + masked future $L_p$)
+$X_{\text{dec}}\in\mathbb{R}^{B\times (L_g+L_p)\times d_{\text{in}}}$
+$\to$ embedding + encoding $\to D^{(0)}$.
+
+\item Decoder stack with causal self-attention and cross-attention
+$\to D^{(N_d)}\in\mathbb{R}^{B\times (L_g+L_p)\times d_{\text{model}}}$.
+
+\item Output projection
+\[
+\hat{Y} = D^{(N_d)} W_{\text{proj}} + b_{\text{proj}},
+\qquad
+W_{\text{proj}}\in\mathbb{R}^{d_{\text{model}}\times d_{\text{out}}}.
+\]
+For univariate forecasting of coordinate $a$, $d_{\text{out}}=1$ and we take the last $L_p$ steps as $\hat{y}\in\mathbb{R}^{B\times L_p}$.
+\end{enumerate}
+
+\section{Gradient Flow and Stability}
+
+For a pre-norm residual block
+\[
+H_{\text{out}} = H_{\text{in}} + \mathcal{F}(\mathrm{LN}(H_{\text{in}})),
+\]
+the backward gradient satisfies
+\[
+\frac{\partial \mathcal{L}}{\partial H_{\text{in}}}
+= \frac{\partial \mathcal{L}}{\partial H_{\text{out}}}
+\Big(I + J_{\mathcal{F}}J_{\mathrm{LN}}\Big),
+\]
+where $J_{\mathcal{F}}$ and $J_{\mathrm{LN}}$ are the respective Jacobians.
+The identity path preserves gradient magnitude even when
+$J_{\mathcal{F}}$ is small. Since $\|J_{\mathrm{LN}}\|_2$ is bounded,
+gradients remain stable across depth.
+
+
+\section{Loss, Optimisation, and Learning Schedule}
+
+\subsection{Training Objective}
+
+The model is trained by minimising the mean-squared error between predicted and
+true target values:
+\[
+\mathcal{L}(\theta)
+= \frac{1}{B L_p}\sum_{b=1}^B\sum_{h=1}^{L_p}
+\big(\hat{y}_{b,h}-y_{b,h}\big)^2,
+\]
+where $B$ is the batch size and $L_p$ the prediction horizon.
+This objective penalises large forecast errors and corresponds to the
+negative log-likelihood under an isotropic Gaussian assumption.
+
+\subsection{Optimiser and Regularisation}
+
+We employ the AdamW optimiser with decoupled weight decay.
+Let $\theta_t$ denote model parameters at step $t$.
+The AdamW update rule is:
+\[
+m_t = \beta_1 m_{t-1} + (1-\beta_1)\nabla_\theta \mathcal{L}_t, \qquad
+v_t = \beta_2 v_{t-1} + (1-\beta_2)\big(\nabla_\theta \mathcal{L}_t\big)^2,
+\]
+\[
+\hat{m}_t = \frac{m_t}{1-\beta_1^t}, \qquad
+\hat{v}_t = \frac{v_t}{1-\beta_2^t},
+\]
+\[
+\theta_{t+1} = \theta_t
+- \eta_t \frac{\hat{m}_t}{\sqrt{\hat{v}_t} + \epsilon}
+- \eta_t\,\lambda\,\theta_t,
+\]
+where $\lambda$ is the weight-decay coefficient and $\eta_t$ is the learning rate.
+The second term, $-\eta_t\lambda\theta_t$, applies \emph{decoupled}
+$L_2$ regularisation, preventing bias terms and LayerNorm parameters from
+being penalised.
+In implementation, parameters are divided into two groups:
+those with $\mathrm{dim}(\theta) \ge 2$ (matrix weights) receive weight decay $\lambda$,
+while 1D parameters such as biases and normalization gains use $\lambda=0$.
+This selective regularisation matches the configuration:
+\[
+\texttt{decay\_params: dim}(\theta)\ge2,\qquad
+\texttt{nodecay\_params: dim}(\theta)<2.
+\]
+The AdamW coefficients follow transformer conventions:
+$\beta_1=0.9$, $\beta_2=0.95$, and $\epsilon=10^{-8}$.
+When CUDA is available, the optimiser uses fused operations for efficiency.
+
+\paragraph{Weight Decay Intuition.}
+Decoupled weight decay discourages overfitting by shrinking large weights
+toward zero without coupling the penalty to the gradient magnitude.
+Unlike classical $L_2$ regularisation within the loss function,
+AdamW’s decoupled formulation maintains consistent learning dynamics
+even under adaptive gradient scaling.
+
+\subsection{Gradient Clipping and Mixed Precision}
+
+To prevent exploding gradients, the global gradient norm is constrained by
+a fixed upper bound $\gamma$:
+\[
+\nabla\theta \;\leftarrow\;
+\frac{\nabla\theta}{\max\!\left(1,\,
+\frac{\|\nabla\theta\|_2}{\gamma}\right)}.
+\]
+If $\|\nabla\theta\|_2 > \gamma$, the entire gradient tensor is rescaled
+to have norm $\gamma$.
+In code, this is performed with
+\texttt{torch.nn.utils.clip\_grad\_norm\_(model.parameters(), grad\_clip)}.
+This stabilises updates for deep transformer stacks
+and ensures that outlier batches do not destabilise training.
+
+Training is performed in mixed precision (AMP) when running on GPU,
+with gradient scaling via \texttt{torch.amp.GradScaler} to avoid underflow.
+Gradients are unscaled prior to clipping to ensure correct norm computation.
+
+\subsection{Learning-Rate Schedule}
+
+The learning rate $\eta(s)$ follows a two-phase schedule combining linear
+warm-up and cosine decay:
+\[
+\eta(s) =
+\begin{cases}
+\eta_0\,\dfrac{s}{S_w}, & s < S_w,\\[6pt]
+\eta_{\min}
++ (\eta_0 - \eta_{\min})
+\dfrac{1 + \cos\!\big(\pi\,\tfrac{s - S_w}{S - S_w}\big)}{2},
+& s \ge S_w,
+\end{cases}
+\]
+where:
+\begin{itemize}
+    \item $\eta_0$ is the initial (peak) learning rate,
+    \item $\eta_{\min}$ is the minimum rate at the end of training,
+    \item $S_w$ is the number of warm-up steps, and
+    \item $S$ is the total training step budget.
+\end{itemize}
+During warm-up ($s<S_w$), the learning rate increases linearly from $0$ to $\eta_0$
+to prevent early divergence.
+After warm-up, cosine decay gradually anneals $\eta$ toward $\eta_{\min}$
+for smooth convergence.
+
+\subsection{Parameter Initialization}
+
+To ensure stable training and consistent gradient scales,
+all linear projection layers are initialized following a zero-mean normal distribution:
+\[
+W_{ij} \sim \mathcal{N}(0,\, 0.02^2),
+\qquad
+b_i = 0.
+\]
+Layer normalization parameters retain their defaults
+($\gamma=1$, $\beta=0$).
+This \emph{partial GPT-style initialization} controls the variance
+of forward activations and supports stable gradient propagation
+across attention and feed-forward blocks.
+
+\paragraph{Implementation note.}
+In the codebase, this scheme is encapsulated in the utility
+\texttt{init\_weights(module, std=0.02)},
+which applies normal initialization to all linear layers
+and zeroes their biases, leaving normalization layers unchanged.
+
+\end{document}

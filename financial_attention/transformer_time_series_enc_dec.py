@@ -326,6 +326,8 @@ class EncoderLayer(nn.Module):
                 nn.ELU(),
                 nn.MaxPool1d(kernel_size=3, stride=2, padding=1)
             )
+            if self.norm_mode == "post":
+                self.norm_after_distill = nn.LayerNorm(d_model)
 
     def forward(self, x):
         if self.norm_mode == "pre":
@@ -339,6 +341,8 @@ class EncoderLayer(nn.Module):
             x = self.norm2(x + self.dropout(ff_out))
         if self.distill:
             x = self.conv(x.transpose(1, 2)).transpose(1, 2)
+            if self.norm_mode == "post":
+                x = self.norm_after_distill(x)
         return x
 
 class DecoderLayer(nn.Module):
