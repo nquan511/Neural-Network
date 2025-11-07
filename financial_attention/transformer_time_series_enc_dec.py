@@ -203,9 +203,8 @@ class ProbSparseSelfAttention(Attention):
             mean_K = Q_K_sample.mean(dim=-1, keepdim=True)
 
         # Compute sparsity scores:
-        # 1. Add epsilon for numerical stability
-        # 2. Use logsumexp for stable probability computation
-        # 3. Subtract mean to get relative importance
+        # 1. Use logsumexp for stable probability computation
+        # 2. Subtract mean to get relative importance
         M = torch.logsumexp(Q_K_sample, dim=-1) - mean_K.squeeze(-1)
 
         # Select top-n query positions based on sparsity scores
@@ -239,9 +238,34 @@ class ProbSparseSelfAttention(Attention):
         with torch.no_grad():
             context = V.mean(dim=2, keepdim=True).expand(-1, -1, L_Q, -1).clone()
 
-        # Extract top queries and compute their attention scores
-        # Shape: [B, H, n_top, d_k]
-        Q_top = torch.gather(Q, 2, M_top.unsqueeze(-1).expand(-1, -1, -1, self.d_k))
+        # -------------------------------------------------------------------------
+        # Extract the query vectors corresponding to the top-n most important
+        # query positions (as determined by ProbSparse scoring).
+        # -------------------------------------------------------------------------
+
+        # Q:       [B, H, L_Q, d_k]   → all query vectors
+        # M_top:   [B, H, n_top]      → integer indices of top query positions
+        # Goal:    Q_top = [B, H, n_top, d_k] containing only those top queries
+
+        # Step 1: Add a trailing dimension so M_top has the same rank as Q.
+        #         Shape: [B, H, n_top, 1]
+        M_top_expanded = M_top.unsqueeze(-1)
+
+        # Step 2: Broadcast indices across the feature dimension (d_k)
+        #         so we can gather all d_k components for each selected query.
+        #         Shape: [B, H, n_top, d_k]
+        M_top_expanded = M_top_expanded.expand(-1, -1, -1, self.d_k)
+
+        # Step 3: Gather query vectors at the selected indices along dim=2
+        #         (the sequence-length / query-position dimension).
+        #         This performs, for each batch/head:
+        #             Q_top[b, h, i, :] = Q[b, h, M_top[b, h, i], :]
+        #         Result shape: [B, H, n_top, d_k]
+        Q_top = torch.gather(Q, dim=2, index=M_top_expanded)
+
+        # Q_top now holds the n_top "most important" queries that will go
+        # through full attention computation.
+
         attn_scores = torch.matmul(Q_top, K.transpose(-2, -1)) / math.sqrt(self.d_k)
 
         # Handle attention masking for top queries
@@ -259,12 +283,35 @@ class ProbSparseSelfAttention(Attention):
         # Compute context vectors for top queries
         context_top = torch.matmul(attn, V)
 
-        # Update context with computed values at top query positions
-        # Uses scatter_ to place computed attention results in the right positions
-        context.scatter_(2, M_top.unsqueeze(-1).expand(-1, -1, -1, self.d_k), context_top)
+        # -------------------------------------------------------------------------
+        # Update the base context tensor with the newly computed attention outputs
+        # for the top-n query positions.
+        #
+        # context:     [B, H, L_Q, d_k]   → initially filled with mean(V)
+        # M_top:       [B, H, n_top]      → indices of top query positions
+        # context_top: [B, H, n_top, d_k] → computed attention outputs for top queries
+        #
+        # Goal: replace rows in 'context' at positions M_top with 'context_top'
+        # -------------------------------------------------------------------------
 
-        # Reshape to output format and apply final projection
+        # In-place scatter update.
+        #   scatter_(dim=2, index, src) writes 'src' values into 'self'
+        #   at positions specified by 'index' along dimension 2 (the sequence axis).
+        #   So for each (batch, head):
+        #       context[b,h,M_top[b,h,:],:] = context_top[b,h,:,:]
+        context.scatter_(dim=2, index=M_top_expanded, src=context_top)
+
+        # -------------------------------------------------------------------------
+        # Reshape the multi-head context back into [B, L_Q, D] for output projection.
+        #
+        # context: [B, H, L_Q, d_k]
+        #   ↓ transpose(1,2): swap head and sequence dims → [B, L_Q, H, d_k]
+        #   ↓ contiguous(): ensure memory layout is sequential (needed before view)
+        #   ↓ view(B, L_Q, D): flatten heads into one vector per position, D = H*d_k
+        # -------------------------------------------------------------------------
         out = context.transpose(1, 2).contiguous().view(B, L_Q, D)
+
+        # Final linear projection (mixes heads)
         return self.o_proj(out)
 
 # =====================================================
@@ -292,7 +339,7 @@ class EncoderLayer(nn.Module):
        
     3. Optional Distillation (if enabled):
        - Convolutional layer for local feature extraction
-       - ELU activation for smooth gradients
+       - GELU activation for smooth gradients
        - MaxPool for sequence length reduction
     
     Args:
@@ -323,7 +370,7 @@ class EncoderLayer(nn.Module):
         if distill:
             self.conv = nn.Sequential(
                 nn.Conv1d(d_model, d_model, kernel_size=3, padding=1),
-                nn.ELU(),
+                nn.GELU(),
                 nn.MaxPool1d(kernel_size=3, stride=2, padding=1)
             )
             if self.norm_mode == "post":
@@ -571,7 +618,7 @@ class TimeEmbedding(nn.Module):
         # Projection to model dimension (jointly learns temporal interactions)
         self.time_mlp = nn.Sequential(
             nn.Linear(embed_dim * 3, d_model),
-            nn.ReLU(inplace=True),
+            nn.GELU(inplace=True),
             nn.Dropout(dropout),
             nn.Linear(d_model, d_model),
         )
